@@ -1,11 +1,10 @@
 import io
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
@@ -90,15 +89,22 @@ def _parse_float(val: object) -> Optional[float]:
         return None
 
 
+def _roc_to_date(roc_str: str) -> Optional[date]:
+    parts = roc_str.strip().split("/")
+    if len(parts) != 3:
+        return None
+    try:
+        return date(int(parts[0]) + 1911, int(parts[1]), int(parts[2]))
+    except ValueError:
+        return None
+
+
 @st.cache_data(ttl=1800)
 def load_all_tw_stocks() -> List[dict]:
-    """
-    Load all TWSE (上市) and TPEx (上櫃) stock codes, company names, and latest closing prices.
-    """
+    """Load all TWSE (上市) and TPEx (上櫃) stock codes, company names, and latest closing prices."""
     catalog: List[dict] = []
     seen = set()
 
-    # 1. TWSE OpenAPI (上市)
     try:
         resp = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=HEADERS, timeout=10)
         resp.raise_for_status()
@@ -112,7 +118,6 @@ def load_all_tw_stocks() -> List[dict]:
     except Exception:
         pass
 
-    # 2. TPEx OpenAPI (上櫃)
     try:
         resp = requests.get(
             "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
@@ -130,7 +135,6 @@ def load_all_tw_stocks() -> List[dict]:
     except Exception:
         pass
 
-    # Ensure demo stocks are always present as fallback
     for code, info in DEMO_STOCKS.items():
         if code not in seen:
             catalog.append(
@@ -146,9 +150,7 @@ def resolve_stock_query(query: str, catalog: List[dict]) -> List[dict]:
     if not q:
         return [c for c in catalog if c["code"] == "2330"] or catalog[:1]
 
-    # Support "2330 台積電" format
     first_token = q.split()[0]
-
     exact_code = [c for c in catalog if c["code"].lower() == first_token.lower()]
     if exact_code:
         return exact_code
@@ -157,15 +159,66 @@ def resolve_stock_query(query: str, catalog: List[dict]) -> List[dict]:
     if exact_name:
         return exact_name
 
-    partial = [
-        c for c in catalog
-        if q.lower() in c["code"].lower() or q.lower() in c["name"].lower()
-    ]
+    partial = [c for c in catalog if q.lower() in c["code"].lower() or q.lower() in c["name"].lower()]
     return partial[:20]
 
 
+@st.cache_data(ttl=900)
+def fetch_margin_history(stock_id: str) -> pd.DataFrame:
+    """Fetch recent ~40 trading days of margin balance & daily change from Fubon DJ zcn.djhtm."""
+    url = f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zcn/zcn.djhtm?a={stock_id}&b=3"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        resp.encoding = resp.apparent_encoding or "big5"
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        rows = []
+        for tr in soup.find_all("tr"):
+            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if len(tds) >= 6:
+                dt = _roc_to_date(tds[0])
+                if dt is None:
+                    continue
+                bal = _parse_float(tds[4])
+                chg = _parse_float(tds[5])
+                if bal is not None and chg is not None:
+                    rows.append({"日期": dt, "融資餘額": int(bal), "融資增減": int(chg)})
+
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows).sort_values("日期").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def detect_turning_points(margin_df: pd.DataFrame) -> dict:
+    """Detect margin inflection points: lowest margin balance date & biggest single-day spike date."""
+    today = date.today()
+    info = {
+        "min_bal_date": today - timedelta(days=30),
+        "max_spike_date": today - timedelta(days=18),
+        "latest_date": today,
+    }
+    if margin_df.empty:
+        return info
+
+    info["latest_date"] = margin_df["日期"].iloc[-1]
+    min_idx = margin_df["融資餘額"].idxmin()
+    info["min_bal_date"] = margin_df.loc[min_idx, "日期"]
+
+    pos_df = margin_df[margin_df["融資增減"] > 0]
+    if not pos_df.empty:
+        spike_idx = pos_df["融資增減"].idxmax()
+        info["max_spike_date"] = margin_df.loc[spike_idx, "日期"]
+    else:
+        info["max_spike_date"] = info["min_bal_date"]
+
+    return info
+
+
 def _parse_fubon_dj_page(html_text: str, fallback_price: float) -> Tuple[List[dict], float]:
-    """Parse a single Fubon DJ zco.djhtm page for net-buy branches and平均買超成本."""
     soup = BeautifulSoup(html_text, "lxml")
     page_text = soup.get_text(" ", strip=True)
 
@@ -193,7 +246,6 @@ def _parse_fubon_dj_page(html_text: str, fallback_price: float) -> Tuple[List[di
                             "分點名稱": broker,
                             "買進張數": buy_lots,
                             "賣出張數": sell_lots,
-                            "買超張數": net_lots,
                         }
                     )
             except ValueError:
@@ -203,38 +255,45 @@ def _parse_fubon_dj_page(html_text: str, fallback_price: float) -> Tuple[List[di
 
 
 @st.cache_data(ttl=600)
-def fetch_fubon_dj_branches(stock_id: str, fallback_price: float, lookback_days: int = 5) -> Tuple[pd.DataFrame, str]:
+def fetch_fubon_dj_range_weighted(
+    stock_id: str, start_dt: date, end_dt: date, fallback_price: float, chunks: int = 4
+) -> Tuple[pd.DataFrame, str]:
     """
-    Fetch recent N trading days of broker net-buy tables from Fubon DJ (公開免費網頁)
-    and compute each broker branch's volume-weighted average buy cost across those days.
+    Split [start_dt, end_dt] into `chunks` sub-windows on Fubon DJ zco.djhtm
+    to cover 20-84 calendar days quickly while preserving per-window cost differences.
     """
-    agg: Dict[str, dict] = {}
-    days_found = 0
-    cursor = datetime.now()
-    checked = 0
+    if start_dt > end_dt:
+        start_dt = end_dt - timedelta(days=20)
 
-    while days_found < lookback_days and checked < lookback_days * 3:
-        checked += 1
-        if cursor.weekday() < 5:
-            d_str = f"{cursor.year}-{cursor.month}-{cursor.day}"
-            url = f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm?a={stock_id}&e={d_str}&f={d_str}"
-            try:
-                resp = requests.get(url, headers=HEADERS, timeout=10)
-                if resp.status_code == 200:
-                    resp.encoding = resp.apparent_encoding or "big5"
-                    day_rows, day_cost = _parse_fubon_dj_page(resp.text, fallback_price)
-                    if day_rows:
-                        days_found += 1
-                        for r in day_rows:
-                            name = r["分點名稱"]
-                            if name not in agg:
-                                agg[name] = {"buy": 0, "sell": 0, "value": 0.0}
-                            agg[name]["buy"] += r["買進張數"]
-                            agg[name]["sell"] += r["賣出張數"]
-                            agg[name]["value"] += r["買進張數"] * day_cost
-            except Exception:
-                pass
-        cursor -= timedelta(days=1)
+    total_days = max(1, (end_dt - start_dt).days + 1)
+    actual_chunks = min(chunks, total_days)
+    step = total_days / actual_chunks
+
+    agg: Dict[str, dict] = {}
+    for i in range(actual_chunks):
+        w_start = start_dt + timedelta(days=int(round(i * step)))
+        w_end = end_dt if i == actual_chunks - 1 else start_dt + timedelta(days=int(round((i + 1) * step)) - 1)
+        if w_start > w_end:
+            w_end = w_start
+
+        e_str = f"{w_start.year}-{w_start.month}-{w_start.day}"
+        f_str = f"{w_end.year}-{w_end.month}-{w_end.day}"
+        url = f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm?a={stock_id}&e={e_str}&f={f_str}"
+
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            if resp.status_code == 200:
+                resp.encoding = resp.apparent_encoding or "big5"
+                win_rows, win_cost = _parse_fubon_dj_page(resp.text, fallback_price)
+                for r in win_rows:
+                    name = r["分點名稱"]
+                    if name not in agg:
+                        agg[name] = {"buy": 0, "sell": 0, "value": 0.0}
+                    agg[name]["buy"] += r["買進張數"]
+                    agg[name]["sell"] += r["賣出張數"]
+                    agg[name]["value"] += r["買進張數"] * win_cost
+        except Exception:
+            pass
 
     if agg:
         result_rows = []
@@ -250,7 +309,7 @@ def fetch_fubon_dj_branches(stock_id: str, fallback_price: float, lookback_days:
                 )
         if result_rows:
             df = pd.DataFrame(result_rows).sort_values(by="買進張數", ascending=False).head(30)
-            return df.reset_index(drop=True), f"近 {days_found} 個交易日加權"
+            return df.reset_index(drop=True), f"{start_dt.strftime('%Y/%m/%d')} ~ {end_dt.strftime('%Y/%m/%d')}"
 
     # Fallback: default single summary page
     default_url = f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm?a={stock_id}&e="
@@ -272,14 +331,13 @@ def fetch_fubon_dj_branches(stock_id: str, fallback_price: float, lookback_days:
             for r in day_rows
         ]
     )
-    return df, "單日彙總"
+    return df, "單日預設彙總"
 
 
 @st.cache_data(ttl=600)
-def fetch_finmind_branches(stock_id: str, token: str, days: int = 10) -> Tuple[pd.DataFrame, float]:
-    """Fetch exact broker branch buy/sell & weighted avg cost via FinMind Sponsor API."""
+def fetch_finmind_branches(stock_id: str, token: str, days: int = 20) -> Tuple[pd.DataFrame, float]:
     end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=max(days * 2, 14))
+    start_dt = end_dt - timedelta(days=max(days * 2, 20))
     fmt = "%Y-%m-%d"
 
     price_resp = requests.get(
@@ -335,24 +393,27 @@ def fetch_finmind_branches(stock_id: str, token: str, days: int = 10) -> Tuple[p
     return result.reset_index(drop=True), latest_close
 
 
-def calculate_margin_table(
-    df: pd.DataFrame, sim_price: float, margin_ratio_pct: float, maint_threshold_pct: float
-) -> pd.DataFrame:
+def calculate_margin_metrics(
+    df: pd.DataFrame, current_price: float, margin_ratio_pct: float, maint_threshold_pct: float
+) -> Tuple[pd.DataFrame, dict]:
+    """Compute per-branch liquidation price & summary wave triggers against current_price."""
+    if df.empty:
+        return df, {}
+
     out = df.copy()
     ratio = margin_ratio_pct / 100.0
     threshold = maint_threshold_pct / 100.0
 
     out["淨買超(張)"] = (out["買進張數"] - out["賣出張數"]).clip(lower=0)
     out = out[out["淨買超(張)"] > 0].copy()
+    if out.empty:
+        return out, {}
 
-    out["推估融資金額(萬)"] = ((out["淨買超(張)"] * 1000 * out["買進均價"] * ratio) / 10000).round(0)
     out["斷頭價位(元)"] = (out["買進均價"] * ratio * threshold).round(2)
-
     denom = out["買進均價"] * ratio
-    out["目前維持率(%)"] = ((sim_price / denom.replace(0, pd.NA)) * 100).round(1)
-    out["距斷頭空間(%)"] = (
-        ((sim_price - out["斷頭價位(元)"]) / sim_price * 100) if sim_price > 0 else 0.0
-    ).round(1)
+    out["目前維持率(%)"] = ((current_price / denom.replace(0, pd.NA)) * 100).round(1)
+    # 距離斷頭還需下跌幾 % (負值表示還需下跌的幅度；正值表示現價已低於斷頭價)
+    out["距斷頭跌幅(%)"] = (((out["斷頭價位(元)"] - current_price) / current_price) * 100).round(1)
 
     def classify(m: float) -> str:
         if pd.isna(m):
@@ -364,11 +425,73 @@ def calculate_margin_table(
         return "🟢 安全"
 
     out["風險狀態"] = out["目前維持率(%)"].apply(classify)
-    return out.sort_values(by="斷頭價位(元)", ascending=False).reset_index(drop=True)
+    out = out.sort_values(by="斷頭價位(元)", ascending=False).reset_index(drop=True)
+
+    # 1) 第一個開始斷頭的分點（斷頭價最高）
+    first_row = out.iloc[0]
+    first_price = float(first_row["斷頭價位(元)"])
+    first_drop_pct = ((first_price - current_price) / current_price) * 100.0
+
+    # 2) 最大波斷頭潮區間（把斷頭價分成 5 個區間，找張數最多的區間）
+    min_call = float(out["斷頭價位(元)"].min())
+    max_call = float(out["斷頭價位(元)"].max())
+    if max_call - min_call < 0.5:
+        peak_label = f"{min_call:,.1f} 元"
+        peak_trigger_price = min_call
+        peak_lots = int(out["淨買超(張)"].sum())
+        wall_df = pd.DataFrame(
+            {
+                "斷頭價區間": [peak_label],
+                "潛在斷頭張數": [peak_lots],
+                "狀態": ["已觸發" if current_price <= min_call else "未觸發"],
+            }
+        )
+    else:
+        bins = pd.cut(out["斷頭價位(元)"], bins=5)
+        grouped_wall = out.groupby(bins, observed=False)["淨買超(張)"].sum().reset_index()
+        peak_idx = grouped_wall["淨買超(張)"].idxmax()
+        peak_iv = grouped_wall.loc[peak_idx, "斷頭價位(元)"]
+        peak_lots = int(grouped_wall.loc[peak_idx, "淨買超(張)"])
+        peak_trigger_price = float(peak_iv.right)
+        peak_label = f"{peak_iv.left:,.0f}~{peak_iv.right:,.0f} 元"
+
+        wall_df = pd.DataFrame(
+            {
+                "斷頭價區間": [f"{iv.left:,.0f}~{iv.right:,.0f}" for iv in grouped_wall["斷頭價位(元)"]],
+                "潛在斷頭張數": grouped_wall["淨買超(張)"].astype(int),
+                "狀態": [
+                    "已觸發" if current_price <= iv.right else "未觸發"
+                    for iv in grouped_wall["斷頭價位(元)"]
+                ],
+            }
+        )
+
+    peak_drop_pct = ((peak_trigger_price - current_price) / current_price) * 100.0
+    total_lots = int(out["淨買超(張)"].sum())
+    weighted_call = float((out["斷頭價位(元)"] * out["淨買超(張)"]).sum() / total_lots) if total_lots else 0.0
+
+    summary = {
+        "first_broker": str(first_row["分點名稱"]),
+        "first_price": first_price,
+        "first_drop_pct": first_drop_pct,
+        "peak_label": peak_label,
+        "peak_trigger_price": peak_trigger_price,
+        "peak_drop_pct": peak_drop_pct,
+        "peak_lots": peak_lots,
+        "weighted_call": weighted_call,
+        "wall_df": wall_df,
+    }
+    return out, summary
+
+
+def fmt_drop_text(drop_pct: float) -> str:
+    if drop_pct >= 0:
+        return f"已觸發（低於門檻 {drop_pct:.1f}%）"
+    return f"再跌 {abs(drop_pct):.1f}%"
 
 
 # -----------------------------------------------------------------------------
-# Main Page Header & Search Bar (Supports Stock Code or Company Name)
+# Main Page Header & Search Bar
 # -----------------------------------------------------------------------------
 st.title("📡 台股分點融資斷頭雷達")
 
@@ -413,8 +536,6 @@ data_source = st.sidebar.radio(
     index=0,
 )
 
-lookback_days = st.sidebar.slider("分點成本統計天數（免費即時模式）", min_value=1, max_value=10, value=5, step=1)
-
 market_options = ["自動偵測", "上市 (60%)", "上櫃 (50%)", "自訂"]
 market_type = st.sidebar.selectbox("市場別 / 融資成數預設", market_options, index=0)
 
@@ -430,179 +551,212 @@ else:
 margin_ratio_pct = st.sidebar.slider("融資成數 (%)", min_value=10, max_value=80, value=default_ratio, step=5)
 maint_threshold_pct = st.sidebar.number_input("斷頭/追繳維持率門檻 (%)", min_value=100, max_value=170, value=130, step=1)
 
-# Load Data based on selected source
-raw_df = pd.DataFrame()
-base_price = 100.0
+# -----------------------------------------------------------------------------
+# Compute All 3 Methods Simultaneously
+# -----------------------------------------------------------------------------
 stock_label = f"{stock_id} {detected_name} ({detected_market})".strip()
-source_note = ""
+fallback_close = float(detected_close) if detected_close else 100.0
+if data_source.startswith("免費即時"):
+    fallback_close = st.sidebar.number_input("若抓不到收盤價，手動輸入現價 (元)", min_value=1.0, value=fallback_close, step=1.0)
+
+current_price = fallback_close
+margin_hist_df = pd.DataFrame()
+methods_raw: Dict[str, Tuple[pd.DataFrame, str]] = {}
 
 if data_source.startswith("免費即時"):
-    fallback_close = st.sidebar.number_input(
-        "若抓不到收盤價，手動輸入基準價 (元)",
-        min_value=1.0,
-        value=float(detected_close) if detected_close else 100.0,
-        step=1.0,
-    )
-    base_price = float(detected_close) if detected_close else fallback_close
-    try:
-        raw_df, window_label = fetch_fubon_dj_branches(stock_id, base_price, lookback_days=lookback_days)
-        price_src = "櫃買中心 OpenAPI" if detected_market == "上櫃" else "證交所 OpenAPI"
-        source_note = (
-            f"已從**{price_src}**取得收盤價 `{base_price:,.1f} 元`，並彙總**{window_label}**各日分點買進張數與每日平均買超成本"
-            "（若仍需微調個別分點成本，可在下方表格直接編輯）。"
-        )
-    except Exception as e:
-        st.warning(f"免費即時抓取失敗（{e}），已自動切換為範例數據。")
+    margin_hist_df = fetch_margin_history(stock_id)
+    tp = detect_turning_points(margin_hist_df)
+    end_dt = tp["latest_date"]
+
+    targets = [
+        ("融資起增日", tp["min_bal_date"], end_dt),
+        ("單日爆量日", tp["max_spike_date"], end_dt),
+        ("近60日波段", end_dt - timedelta(days=84), end_dt),
+    ]
+
+    live_ok = True
+    for label, s_dt, e_dt in targets:
+        try:
+            df_m, rng_str = fetch_fubon_dj_range_weighted(stock_id, s_dt, e_dt, current_price, chunks=4)
+            methods_raw[label] = (df_m, rng_str)
+        except Exception:
+            live_ok = False
+            break
+
+    if not live_ok:
+        st.warning("免費即時抓取受限或無分點資料，已自動切換為內建範例數據供參考。")
         preset = DEMO_STOCKS.get(stock_id, DEMO_STOCKS["2330"])
-        stock_label = f"{stock_id if stock_id in DEMO_STOCKS else '2330'} {preset['name']} (備援範例)"
-        base_price = preset["close"]
-        raw_df = pd.DataFrame(preset["branches"])
+        current_price = preset["close"]
+        base_df = pd.DataFrame(preset["branches"])
+        methods_raw = {
+            "融資起增日": (base_df.copy(), "範例起增日"),
+            "單日爆量日": (base_df.assign(買進均價=(base_df["買進均價"] * 1.015).round(1)), "範例爆量日"),
+            "近60日波段": (base_df.assign(買進均價=(base_df["買進均價"] * 0.97).round(1)), "範例60日"),
+        }
 
 elif data_source.startswith("範例"):
     preset = DEMO_STOCKS.get(stock_id, DEMO_STOCKS["2330"])
-    if stock_id not in DEMO_STOCKS:
-        stock_label = f"2330 {DEMO_STOCKS['2330']['name']} (範例)"
-    base_price = preset["close"]
-    raw_df = pd.DataFrame(preset["branches"])
-    source_note = "目前顯示內建範例模擬數據，可供直接體驗壓力測試。"
+    current_price = preset["close"]
+    base_df = pd.DataFrame(preset["branches"])
+    methods_raw = {
+        "融資起增日": (base_df.copy(), "範例起增日"),
+        "單日爆量日": (base_df.assign(買進均價=(base_df["買進均價"] * 1.015).round(1)), "範例爆量日"),
+        "近60日波段": (base_df.assign(買進均價=(base_df["買進均價"] * 0.97).round(1)), "範例60日"),
+    }
 
 elif data_source.startswith("上傳"):
     uploaded = st.sidebar.file_uploader("上傳 CSV（欄位：分點名稱,買進張數,賣出張數,買進均價）", type=["csv"])
-    base_price = st.sidebar.number_input("個股目前收盤價 (元)", min_value=1.0, value=100.0, step=0.5)
+    current_price = st.sidebar.number_input("個股目前收盤價 (元)", min_value=1.0, value=100.0, step=0.5)
     if uploaded is not None:
-        raw_df = pd.read_csv(io.BytesIO(uploaded.read()))
-        source_note = f"已載入自訂 CSV：{uploaded.name}"
+        u_df = pd.read_csv(io.BytesIO(uploaded.read()))
+        methods_raw = {"自訂匯入": (u_df, uploaded.name)}
     else:
-        st.info("請在左側上傳 CSV 檔案，格式：`分點名稱,買進張數,賣出張數,買進均價`。")
-        raw_df = pd.DataFrame(DEMO_STOCKS["2330"]["branches"])
-        base_price = DEMO_STOCKS["2330"]["close"]
+        st.info("請在左側上傳 CSV 檔案，目前暫以範例顯示。")
+        base_df = pd.DataFrame(DEMO_STOCKS["2330"]["branches"])
+        current_price = DEMO_STOCKS["2330"]["close"]
+        methods_raw = {"自訂匯入": (base_df, "範例")}
 
 else:
     fm_token = st.sidebar.text_input("FinMind API Token", type="password")
-    fm_days = st.sidebar.selectbox("統計天數", [5, 10, 20], index=1)
     if fm_token:
         try:
-            raw_df, base_price = fetch_finmind_branches(stock_id, fm_token, fm_days)
-            source_note = f"已從 FinMind 載入 {stock_id} 近 {fm_days} 日分點加權成本。"
+            for label, d_cnt in [("近20日", 20), ("近40日", 40), ("近60日", 60)]:
+                df_m, current_price = fetch_finmind_branches(stock_id, fm_token, d_cnt)
+                methods_raw[label] = (df_m, f"FinMind 近 {d_cnt} 日")
         except Exception as e:
             st.error(f"FinMind 讀取失敗：{e}")
-            raw_df = pd.DataFrame(DEMO_STOCKS["2330"]["branches"])
-            base_price = DEMO_STOCKS["2330"]["close"]
+            base_df = pd.DataFrame(DEMO_STOCKS["2330"]["branches"])
+            current_price = DEMO_STOCKS["2330"]["close"]
+            methods_raw = {"備援範例": (base_df, "範例")}
     else:
         st.info("請在左側輸入 FinMind Sponsor Token，或切換至「免費即時抓取」。")
-        raw_df = pd.DataFrame(DEMO_STOCKS["2330"]["branches"])
-        base_price = DEMO_STOCKS["2330"]["close"]
+        base_df = pd.DataFrame(DEMO_STOCKS["2330"]["branches"])
+        current_price = DEMO_STOCKS["2330"]["close"]
+        methods_raw = {"備援範例": (base_df, "範例")}
+
+# Run margin calculations for every method
+methods_calc: Dict[str, Tuple[pd.DataFrame, dict, str]] = {}
+for label, (raw_df, rng_str) in methods_raw.items():
+    calc_df, summary = calculate_margin_metrics(raw_df, current_price, margin_ratio_pct, maint_threshold_pct)
+    methods_calc[label] = (calc_df, summary, rng_str)
 
 # -----------------------------------------------------------------------------
-# Dashboard Body
+# Dashboard Body: Current Price & 3-Method Summary Cards
 # -----------------------------------------------------------------------------
-st.caption(f"查詢標的：**{stock_label}** ｜ 基準價：**{base_price:,.1f} 元** ｜ 融資成數：**{margin_ratio_pct}%** ｜ 追繳門檻：**{maint_threshold_pct}%**")
-if source_note:
-    st.info(source_note)
-
-sim_price = st.slider(
-    "📉 模擬現價（左右拖動進行下跌斷頭壓力測試）",
-    min_value=max(1.0, round(base_price * 0.5, 1)),
-    max_value=round(base_price * 1.3, 1),
-    value=float(base_price),
-    step=0.5 if base_price < 200 else 1.0,
+st.caption(
+    f"查詢標的：**{stock_label}** ｜ 目前收盤價：**{current_price:,.1f} 元** ｜ "
+    f"融資成數：**{margin_ratio_pct}%** ｜ 追繳門檻：**{maint_threshold_pct}%**"
 )
 
-with st.expander("✏️ 編輯或微調分點買進均價 / 張數（即時重算）", expanded=False):
-    edited_df = st.data_editor(raw_df, num_rows="dynamic", use_container_width=True)
+st.subheader("📊 三大基準斷頭預警總覽（對照目前股價）")
+cols = st.columns(len(methods_calc))
+for col, (label, (calc_df, summary, rng_str)) in zip(cols, methods_calc.items()):
+    with col:
+        with st.container(border=True):
+            st.markdown(f"#### {label}")
+            st.caption(f"統計區間：{rng_str}")
+            if summary:
+                st.metric(
+                    "① 開始有分點斷頭",
+                    f"{summary['first_price']:,.1f} 元",
+                    f"{fmt_drop_text(summary['first_drop_pct'])}（{summary['first_broker']}）",
+                    delta_color="inverse",
+                )
+                st.metric(
+                    "② 最大波斷頭潮區間",
+                    f"{summary['peak_label']}",
+                    f"{fmt_drop_text(summary['peak_drop_pct'])}（約 {summary['peak_lots']:,} 張）",
+                    delta_color="inverse",
+                )
+                st.caption(f"加權平均斷頭價：**{summary['weighted_call']:,.1f} 元**")
+            else:
+                st.info("無淨買超分點資料")
 
-calc_df = calculate_margin_table(edited_df, sim_price, margin_ratio_pct, maint_threshold_pct)
-
-# KPI Metrics
-total_lots = int(calc_df["淨買超(張)"].sum()) if not calc_df.empty else 0
-danger_df = calc_df[calc_df["目前維持率(%)"] < maint_threshold_pct]
-danger_lots = int(danger_df["淨買超(張)"].sum()) if not danger_df.empty else 0
-avg_call_price = (
-    (calc_df["斷頭價位(元)"] * calc_df["淨買超(張)"]).sum() / total_lots if total_lots > 0 else 0.0
-)
-diff_pct = ((sim_price - base_price) / base_price * 100) if base_price > 0 else 0.0
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("目前模擬股價", f"{sim_price:,.1f} 元", f"{diff_pct:+.1f}% vs 基準價")
-c2.metric("加權平均斷頭價", f"{avg_call_price:,.1f} 元")
-c3.metric("已破斷頭線分點", f"{len(danger_df)} / {len(calc_df)} 家")
-c4.metric("潛在斷頭賣壓", f"{danger_lots:,} 張", f"佔追蹤買超 {(danger_lots / total_lots * 100):.1f}%" if total_lots else "0.0%")
-
-# Charts (Mobile-friendly: dragmode=False & fixedrange=True prevent accidental zoom/pan on touchscreens)
-col_left, col_right = st.columns(2)
-
-with col_left:
-    st.subheader("各價位區間斷頭賣壓牆")
-    if not calc_df.empty:
-        min_call = float(calc_df["斷頭價位(元)"].min())
-        max_call = float(calc_df["斷頭價位(元)"].max())
-        if max_call - min_call < 0.5:
-            wall_df = pd.DataFrame(
-                {
-                    "斷頭價區間": [f"{min_call:,.1f} 元"],
-                    "潛在斷頭張數": [int(calc_df["淨買超(張)"].sum())],
-                    "狀態": ["已破斷頭線" if sim_price < min_call else "安全/未觸及"],
-                }
-            )
+# -----------------------------------------------------------------------------
+# Unified Broker Comparison Table Across the 3 Methods
+# -----------------------------------------------------------------------------
+if len(methods_calc) > 1:
+    st.subheader("🏦 各分點三種基準斷頭價對照表")
+    merged_df: Optional[pd.DataFrame] = None
+    for label, (calc_df, _, _) in methods_calc.items():
+        if calc_df.empty:
+            continue
+        sub = calc_df[["分點名稱", "淨買超(張)", "斷頭價位(元)", "距斷頭跌幅(%)"]].rename(
+            columns={
+                "淨買超(張)": f"{label}_買超(張)",
+                "斷頭價位(元)": f"{label}_斷頭價",
+                "距斷頭跌幅(%)": f"{label}_距斷頭%",
+            }
+        )
+        if merged_df is None:
+            merged_df = sub
         else:
-            bins = pd.cut(calc_df["斷頭價位(元)"], bins=5)
-            grouped_wall = calc_df.groupby(bins, observed=False)["淨買超(張)"].sum().reset_index()
-            wall_df = pd.DataFrame(
-                {
-                    "斷頭價區間": [f"{iv.left:,.0f}~{iv.right:,.0f}" for iv in grouped_wall["斷頭價位(元)"]],
-                    "潛在斷頭張數": grouped_wall["淨買超(張)"].astype(int),
-                    "狀態": [
-                        "已破斷頭線" if sim_price <= iv.right else "安全/未觸及"
-                        for iv in grouped_wall["斷頭價位(元)"]
-                    ],
-                }
-            )
+            merged_df = pd.merge(merged_df, sub, on="分點名稱", how="outer")
 
+    if merged_df is not None and not merged_df.empty:
+        # Sort by the first method's liquidation price descending
+        first_price_col = [c for c in merged_df.columns if c.endswith("_斷頭價")][0]
+        merged_df = merged_df.sort_values(by=first_price_col, ascending=False).reset_index(drop=True)
+        st.dataframe(merged_df, use_container_width=True, hide_index=True)
+
+# -----------------------------------------------------------------------------
+# Detailed Tabs: Pressure Wall & Full Table per Method
+# -----------------------------------------------------------------------------
+st.subheader("📉 各基準斷頭賣壓牆與分點明細")
+tabs = st.tabs(list(methods_calc.keys()))
+for tab, (label, (calc_df, summary, rng_str)) in zip(tabs, methods_calc.items()):
+    with tab:
+        if calc_df.empty or not summary:
+            st.info("此區間查無淨買超分點資料。")
+            continue
+
+        wall_df = summary["wall_df"]
         fig_wall = px.bar(
             wall_df,
             x="斷頭價區間",
             y="潛在斷頭張數",
             color="狀態",
-            color_discrete_map={"已破斷頭線": "#f43f5e", "安全/未觸及": "#38bdf8"},
+            color_discrete_map={"已觸發": "#f43f5e", "未觸發": "#38bdf8"},
+            title=f"{label}（{rng_str}）— 各價位斷頭賣壓分佈",
         )
         fig_wall.update_layout(
-            height=340,
-            margin=dict(l=10, r=10, t=30, b=10),
+            height=320,
+            margin=dict(l=10, r=10, t=40, b=10),
             dragmode=False,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             xaxis=dict(fixedrange=True, title="斷頭價位區間 (元)"),
-            yaxis=dict(fixedrange=True, title="淨買超 (張)"),
+            yaxis=dict(fixedrange=True, title="潛在斷頭張數 (張)"),
         )
         st.plotly_chart(fig_wall, use_container_width=True, config=PLOTLY_MOBILE_CONFIG)
 
-with col_right:
-    st.subheader("前十大買超分點：買進均價 vs 斷頭價")
-    if not calc_df.empty:
-        top10 = calc_df.sort_values(by="淨買超(張)", ascending=False).head(10)
-        fig_bar = go.Figure()
-        fig_bar.add_trace(go.Bar(name="買進均價", x=top10["分點名稱"], y=top10["買進均價"], marker_color="#64748b"))
-        fig_bar.add_trace(go.Bar(name="斷頭價位", x=top10["分點名稱"], y=top10["斷頭價位(元)"], marker_color="#f59e0b"))
-        fig_bar.add_hline(y=sim_price, line_dash="dash", line_color="#38bdf8", annotation_text="模擬現價")
-        fig_bar.update_layout(
-            barmode="group",
-            height=340,
-            margin=dict(l=10, r=10, t=30, b=10),
+        st.dataframe(calc_df, use_container_width=True, hide_index=True)
+
+if not margin_hist_df.empty:
+    with st.expander("📈 查看近期融資餘額走勢（轉折偵測依據）", expanded=False):
+        fig_margin = px.line(
+            margin_hist_df,
+            x="日期",
+            y="融資餘額",
+            markers=True,
+            labels={"日期": "交易日", "融資餘額": "融資餘額 (張)"},
+        )
+        fig_margin.update_layout(
+            height=260,
+            margin=dict(l=10, r=10, t=25, b=10),
             dragmode=False,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             xaxis=dict(fixedrange=True),
             yaxis=dict(fixedrange=True),
         )
-        st.plotly_chart(fig_bar, use_container_width=True, config=PLOTLY_MOBILE_CONFIG)
+        st.plotly_chart(fig_margin, use_container_width=True, config=PLOTLY_MOBILE_CONFIG)
 
-# Detailed Table
-st.subheader("📋 分點融資斷頭風險明細")
-st.dataframe(calc_df, use_container_width=True, hide_index=True)
-
-with st.expander("📐 計算公式與資料限制說明"):
+with st.expander("📐 計算公式與實務說明"):
     st.markdown(
-        """
-        - **單筆融資維持率** $= \\frac{\\text{目前股價}}{\\text{買進均價} \\times \\text{融資成數}} \\times 100\\%$
-        - **斷頭／追繳價位** $= \\text{買進均價} \\times \\text{融資成數} \\times \\text{維持率門檻（預設 } 130\\%\\text{）}$
-        - **實務提醒**：證交所與櫃買中心並未公開各券商分點的實際融資使用比例，本工具係以多日分點買進張數搭配當日平均買超成本推算加權成本，實際斷頭與否仍以投資人整戶擔保維持率為準。
+        f"""
+        - **單筆融資維持率** $= \\frac{{\\text{{目前股價}}}}{{\\text{{買進均價}} \\times \\text{{融資成數}}}} \\times 100\\%$
+        - **斷頭／追繳價位** $= \\text{{買進均價}} \\times \\text{{融資成數}} \\times \\text{{維持率門檻（{maint_threshold_pct}%）}}$
+        - **三種起算基準**：
+          1. **融資起增日**：近 40 日融資餘額最低點起算至今日。
+          2. **單日爆量日**：近 40 日單日融資增加張數最多那天起算至今日。
+          3. **近 60 日波段**：近 60 個交易日分 4 段加權計算完整波段成本。
         """
     )
