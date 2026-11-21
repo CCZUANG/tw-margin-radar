@@ -145,7 +145,6 @@ def load_all_tw_stocks() -> List[dict]:
 
 
 def resolve_stock_query(query: str, catalog: List[dict]) -> List[dict]:
-    """Match user query by exact stock code, exact name, or substring."""
     q = query.strip()
     if not q:
         return [c for c in catalog if c["code"] == "2330"] or catalog[:1]
@@ -161,6 +160,48 @@ def resolve_stock_query(query: str, catalog: List[dict]) -> List[dict]:
 
     partial = [c for c in catalog if q.lower() in c["code"].lower() or q.lower() in c["name"].lower()]
     return partial[:20]
+
+
+@st.cache_data(ttl=1800)
+def fetch_official_daily_closes(stock_id: str, market: str) -> pd.DataFrame:
+    """
+    Fetch recent ~3 months of official daily closing prices from TWSE STOCK_DAY
+    (or TPEx) so we can sanity-check any parsed broker cost against real prices.
+    """
+    rows = []
+    now = datetime.now()
+    for m_offset in (0, 1, 2):
+        target = (now.replace(day=1) - timedelta(days=m_offset * 28)).replace(day=1)
+        try:
+            if market == "上市":
+                url = (
+                    f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY"
+                    f"?date={target.strftime('%Y%m%d')}&stockNo={stock_id}&response=json"
+                )
+                resp = requests.get(url, headers=HEADERS, timeout=10).json()
+                for r in resp.get("data", []):
+                    dt = _roc_to_date(r[0])
+                    close_p = _parse_float(r[6])
+                    if dt and close_p:
+                        rows.append({"日期": dt, "收盤價": close_p})
+            else:
+                url = (
+                    f"https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock"
+                    f"?date={target.strftime('%Y/%m/%d')}&code={stock_id}&response=json"
+                )
+                resp = requests.get(url, headers=HEADERS, timeout=10).json()
+                for table in resp.get("tables", []):
+                    for r in table.get("data", []):
+                        dt = _roc_to_date(r[0])
+                        close_p = _parse_float(r[6])
+                        if dt and close_p:
+                            rows.append({"日期": dt, "收盤價": close_p})
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).drop_duplicates("日期").sort_values("日期").reset_index(drop=True)
 
 
 @st.cache_data(ttl=900)
@@ -194,35 +235,47 @@ def fetch_margin_history(stock_id: str) -> pd.DataFrame:
 
 
 def detect_turning_points(margin_df: pd.DataFrame) -> dict:
-    """Detect margin inflection points: lowest margin balance date & biggest single-day spike date."""
     today = date.today()
     info = {
         "min_bal_date": today - timedelta(days=30),
-        "max_spike_date": today - timedelta(days=18),
+        "max_spike_date": today - timedelta(days=20),
         "latest_date": today,
     }
     if margin_df.empty:
         return info
 
-    info["latest_date"] = margin_df["日期"].iloc[-1]
-    min_idx = margin_df["融資餘額"].idxmin()
-    info["min_bal_date"] = margin_df.loc[min_idx, "日期"]
+    latest_dt = margin_df["日期"].iloc[-1]
+    info["latest_date"] = latest_dt
 
-    pos_df = margin_df[margin_df["融資增減"] > 0]
+    # 1) 融資波段最低點（若距離今日不足 7 日曆日，保底往前抓 14 日曆日）
+    min_idx = margin_df["融資餘額"].idxmin()
+    min_bal_dt = margin_df.loc[min_idx, "日期"]
+    if (latest_dt - min_bal_dt).days < 7:
+        min_bal_dt = latest_dt - timedelta(days=14)
+    info["min_bal_date"] = min_bal_dt
+
+    # 2) 波段融資爆量轉折日：排除最近 3 個交易日，找出前段單日融資大增日；
+    # 若沒有或距離過近，保底抓近 20 日曆日以上
+    earlier_df = margin_df.iloc[:-3] if len(margin_df) > 6 else margin_df
+    pos_df = earlier_df[earlier_df["融資增減"] > 0]
     if not pos_df.empty:
         spike_idx = pos_df["融資增減"].idxmax()
-        info["max_spike_date"] = margin_df.loc[spike_idx, "日期"]
+        spike_dt = earlier_df.loc[spike_idx, "日期"]
     else:
-        info["max_spike_date"] = info["min_bal_date"]
+        spike_dt = latest_dt - timedelta(days=28)
+
+    if (latest_dt - spike_dt).days < 10:
+        spike_dt = latest_dt - timedelta(days=20)
+    info["max_spike_date"] = spike_dt
 
     return info
 
 
-def _parse_fubon_dj_page(html_text: str, fallback_price: float) -> Tuple[List[dict], float]:
+def _parse_fubon_dj_page(html_text: str, fallback_price: float) -> Tuple[List[dict], Optional[float]]:
     soup = BeautifulSoup(html_text, "lxml")
     page_text = soup.get_text(" ", strip=True)
 
-    avg_cost = fallback_price
+    avg_cost: Optional[float] = None
     m = re.search(r"平均買超成本\s*([\d,]+\.\d+|[\d,]+)", page_text)
     if m:
         parsed = _parse_float(m.group(1))
@@ -254,13 +307,30 @@ def _parse_fubon_dj_page(html_text: str, fallback_price: float) -> Tuple[List[di
     return rows, avg_cost
 
 
+def _window_price_reference(
+    price_df: pd.DataFrame, w_start: date, w_end: date, fallback_price: float
+) -> Tuple[float, float, float]:
+    """Return (avg_close, min_close, max_close) for [w_start, w_end] from official price history."""
+    if not price_df.empty:
+        sub = price_df[(price_df["日期"] >= w_start) & (price_df["日期"] <= w_end)]
+        if not sub.empty:
+            return float(sub["收盤價"].mean()), float(sub["收盤價"].min()), float(sub["收盤價"].max())
+    return fallback_price, fallback_price * 0.75, fallback_price * 1.25
+
+
 @st.cache_data(ttl=600)
 def fetch_fubon_dj_range_weighted(
-    stock_id: str, start_dt: date, end_dt: date, fallback_price: float, chunks: int = 4
+    stock_id: str,
+    start_dt: date,
+    end_dt: date,
+    fallback_price: float,
+    price_df: pd.DataFrame,
+    chunks: int = 4,
 ) -> Tuple[pd.DataFrame, str]:
     """
-    Split [start_dt, end_dt] into `chunks` sub-windows on Fubon DJ zco.djhtm
-    to cover 20-84 calendar days quickly while preserving per-window cost differences.
+    Split [start_dt, end_dt] into `chunks` sub-windows on Fubon DJ zco.djhtm.
+    Each window's cost is validated against official TWSE/TPEx daily closes so
+    parsing glitches or stale outliers cannot distort liquidation prices.
     """
     if start_dt > end_dt:
         start_dt = end_dt - timedelta(days=20)
@@ -280,11 +350,19 @@ def fetch_fubon_dj_range_weighted(
         f_str = f"{w_end.year}-{w_end.month}-{w_end.day}"
         url = f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm?a={stock_id}&e={e_str}&f={f_str}"
 
+        avg_ref, min_ref, max_ref = _window_price_reference(price_df, w_start, w_end, fallback_price)
+
         try:
             resp = requests.get(url, headers=HEADERS, timeout=10)
             if resp.status_code == 200:
                 resp.encoding = resp.apparent_encoding or "big5"
-                win_rows, win_cost = _parse_fubon_dj_page(resp.text, fallback_price)
+                win_rows, parsed_cost = _parse_fubon_dj_page(resp.text, avg_ref)
+                # Sanity check parsed cost against official window price range
+                if parsed_cost is not None and (min_ref * 0.85 <= parsed_cost <= max_ref * 1.15):
+                    win_cost = parsed_cost
+                else:
+                    win_cost = avg_ref
+
                 for r in win_rows:
                     name = r["分點名稱"]
                     if name not in agg:
@@ -316,10 +394,11 @@ def fetch_fubon_dj_range_weighted(
     resp = requests.get(default_url, headers=HEADERS, timeout=12)
     resp.raise_for_status()
     resp.encoding = resp.apparent_encoding or "big5"
-    day_rows, day_cost = _parse_fubon_dj_page(resp.text, fallback_price)
+    day_rows, parsed_cost = _parse_fubon_dj_page(resp.text, fallback_price)
     if not day_rows:
         raise ValueError("無法從免費券商網頁解析到買超分點，可能為非交易日、無分點明細或連線受限。")
 
+    day_cost = parsed_cost if (parsed_cost and fallback_price * 0.85 <= parsed_cost <= fallback_price * 1.15) else fallback_price
     df = pd.DataFrame(
         [
             {
@@ -396,7 +475,6 @@ def fetch_finmind_branches(stock_id: str, token: str, days: int = 20) -> Tuple[p
 def calculate_margin_metrics(
     df: pd.DataFrame, current_price: float, margin_ratio_pct: float, maint_threshold_pct: float
 ) -> Tuple[pd.DataFrame, dict]:
-    """Compute per-branch liquidation price & summary wave triggers against current_price."""
     if df.empty:
         return df, {}
 
@@ -412,7 +490,6 @@ def calculate_margin_metrics(
     out["斷頭價位(元)"] = (out["買進均價"] * ratio * threshold).round(2)
     denom = out["買進均價"] * ratio
     out["目前維持率(%)"] = ((current_price / denom.replace(0, pd.NA)) * 100).round(1)
-    # 距離斷頭還需下跌幾 % (負值表示還需下跌的幅度；正值表示現價已低於斷頭價)
     out["距斷頭跌幅(%)"] = (((out["斷頭價位(元)"] - current_price) / current_price) * 100).round(1)
 
     def classify(m: float) -> str:
@@ -427,12 +504,11 @@ def calculate_margin_metrics(
     out["風險狀態"] = out["目前維持率(%)"].apply(classify)
     out = out.sort_values(by="斷頭價位(元)", ascending=False).reset_index(drop=True)
 
-    # 1) 第一個開始斷頭的分點（斷頭價最高）
     first_row = out.iloc[0]
     first_price = float(first_row["斷頭價位(元)"])
+    first_buy_price = float(first_row["買進均價"])
     first_drop_pct = ((first_price - current_price) / current_price) * 100.0
 
-    # 2) 最大波斷頭潮區間（把斷頭價分成 5 個區間，找張數最多的區間）
     min_call = float(out["斷頭價位(元)"].min())
     max_call = float(out["斷頭價位(元)"].max())
     if max_call - min_call < 0.5:
@@ -469,25 +545,29 @@ def calculate_margin_metrics(
     peak_drop_pct = ((peak_trigger_price - current_price) / current_price) * 100.0
     total_lots = int(out["淨買超(張)"].sum())
     weighted_call = float((out["斷頭價位(元)"] * out["淨買超(張)"]).sum() / total_lots) if total_lots else 0.0
+    weighted_buy = float((out["買進均價"] * out["淨買超(張)"]).sum() / total_lots) if total_lots else 0.0
 
     summary = {
         "first_broker": str(first_row["分點名稱"]),
         "first_price": first_price,
+        "first_buy_price": first_buy_price,
         "first_drop_pct": first_drop_pct,
         "peak_label": peak_label,
         "peak_trigger_price": peak_trigger_price,
         "peak_drop_pct": peak_drop_pct,
         "peak_lots": peak_lots,
         "weighted_call": weighted_call,
+        "weighted_buy": weighted_buy,
         "wall_df": wall_df,
     }
     return out, summary
 
 
-def fmt_drop_text(drop_pct: float) -> str:
+def fmt_drop_delta(drop_pct: float, suffix: str) -> str:
+    """Format delta with leading '-' for un-triggered drops so Streamlit displays down-arrow."""
     if drop_pct >= 0:
-        return f"已觸發（低於門檻 {drop_pct:.1f}%）"
-    return f"再跌 {abs(drop_pct):.1f}%"
+        return f"+{drop_pct:.1f}% 已觸發 · {suffix}"
+    return f"{drop_pct:.1f}% 再跌至此觸發 · {suffix}"
 
 
 # -----------------------------------------------------------------------------
@@ -561,23 +641,30 @@ if data_source.startswith("免費即時"):
 
 current_price = fallback_close
 margin_hist_df = pd.DataFrame()
+official_price_df = pd.DataFrame()
 methods_raw: Dict[str, Tuple[pd.DataFrame, str]] = {}
 
 if data_source.startswith("免費即時"):
+    official_price_df = fetch_official_daily_closes(stock_id, detected_market)
+    if not official_price_df.empty and (detected_close is None or detected_close <= 0):
+        current_price = float(official_price_df["收盤價"].iloc[-1])
+
     margin_hist_df = fetch_margin_history(stock_id)
     tp = detect_turning_points(margin_hist_df)
     end_dt = tp["latest_date"]
 
     targets = [
         ("融資起增日", tp["min_bal_date"], end_dt),
-        ("單日爆量日", tp["max_spike_date"], end_dt),
+        ("波段爆量起算", tp["max_spike_date"], end_dt),
         ("近60日波段", end_dt - timedelta(days=84), end_dt),
     ]
 
     live_ok = True
     for label, s_dt, e_dt in targets:
         try:
-            df_m, rng_str = fetch_fubon_dj_range_weighted(stock_id, s_dt, e_dt, current_price, chunks=4)
+            df_m, rng_str = fetch_fubon_dj_range_weighted(
+                stock_id, s_dt, e_dt, current_price, official_price_df, chunks=4
+            )
             methods_raw[label] = (df_m, rng_str)
         except Exception:
             live_ok = False
@@ -590,7 +677,7 @@ if data_source.startswith("免費即時"):
         base_df = pd.DataFrame(preset["branches"])
         methods_raw = {
             "融資起增日": (base_df.copy(), "範例起增日"),
-            "單日爆量日": (base_df.assign(買進均價=(base_df["買進均價"] * 1.015).round(1)), "範例爆量日"),
+            "波段爆量起算": (base_df.assign(買進均價=(base_df["買進均價"] * 1.015).round(1)), "範例爆量日"),
             "近60日波段": (base_df.assign(買進均價=(base_df["買進均價"] * 0.97).round(1)), "範例60日"),
         }
 
@@ -600,7 +687,7 @@ elif data_source.startswith("範例"):
     base_df = pd.DataFrame(preset["branches"])
     methods_raw = {
         "融資起增日": (base_df.copy(), "範例起增日"),
-        "單日爆量日": (base_df.assign(買進均價=(base_df["買進均價"] * 1.015).round(1)), "範例爆量日"),
+        "波段爆量起算": (base_df.assign(買進均價=(base_df["買進均價"] * 1.015).round(1)), "範例爆量日"),
         "近60日波段": (base_df.assign(買進均價=(base_df["買進均價"] * 0.97).round(1)), "範例60日"),
     }
 
@@ -644,7 +731,7 @@ for label, (raw_df, rng_str) in methods_raw.items():
 # Dashboard Body: Current Price & 3-Method Summary Cards
 # -----------------------------------------------------------------------------
 st.caption(
-    f"查詢標的：**{stock_label}** ｜ 目前收盤價：**{current_price:,.1f} 元** ｜ "
+    f"查詢標的：**{stock_label}** ｜ 目前基準收盤價：**{current_price:,.1f} 元** ｜ "
     f"融資成數：**{margin_ratio_pct}%** ｜ 追繳門檻：**{maint_threshold_pct}%**"
 )
 
@@ -659,16 +746,18 @@ for col, (label, (calc_df, summary, rng_str)) in zip(cols, methods_calc.items())
                 st.metric(
                     "① 開始有分點斷頭",
                     f"{summary['first_price']:,.1f} 元",
-                    f"{fmt_drop_text(summary['first_drop_pct'])}（{summary['first_broker']}）",
-                    delta_color="inverse",
+                    fmt_drop_delta(summary["first_drop_pct"], summary["first_broker"]),
+                    delta_color="normal",
                 )
                 st.metric(
                     "② 最大波斷頭潮區間",
                     f"{summary['peak_label']}",
-                    f"{fmt_drop_text(summary['peak_drop_pct'])}（約 {summary['peak_lots']:,} 張）",
-                    delta_color="inverse",
+                    fmt_drop_delta(summary["peak_drop_pct"], f"約 {summary['peak_lots']:,} 張"),
+                    delta_color="normal",
                 )
-                st.caption(f"加權平均斷頭價：**{summary['weighted_call']:,.1f} 元**")
+                st.caption(
+                    f"加權買進均價：**{summary['weighted_buy']:,.1f} 元** ｜ 加權斷頭價：**{summary['weighted_call']:,.1f} 元**"
+                )
             else:
                 st.info("無淨買超分點資料")
 
@@ -694,7 +783,6 @@ if len(methods_calc) > 1:
             merged_df = pd.merge(merged_df, sub, on="分點名稱", how="outer")
 
     if merged_df is not None and not merged_df.empty:
-        # Sort by the first method's liquidation price descending
         first_price_col = [c for c in merged_df.columns if c.endswith("_斷頭價")][0]
         merged_df = merged_df.sort_values(by=first_price_col, ascending=False).reset_index(drop=True)
         st.dataframe(merged_df, use_container_width=True, hide_index=True)
@@ -754,9 +842,6 @@ with st.expander("📐 計算公式與實務說明"):
         f"""
         - **單筆融資維持率** $= \\frac{{\\text{{目前股價}}}}{{\\text{{買進均價}} \\times \\text{{融資成數}}}} \\times 100\\%$
         - **斷頭／追繳價位** $= \\text{{買進均價}} \\times \\text{{融資成數}} \\times \\text{{維持率門檻（{maint_threshold_pct}%）}}$
-        - **三種起算基準**：
-          1. **融資起增日**：近 40 日融資餘額最低點起算至今日。
-          2. **單日爆量日**：近 40 日單日融資增加張數最多那天起算至今日。
-          3. **近 60 日波段**：近 60 個交易日分 4 段加權計算完整波段成本。
+        - **價位校驗**：系統會抓取[證交所](https://www.twse.com.tw/)/[櫃買中心](https://www.tpex.org.tw/)近 3 個月官方每日收盤價，自動校驗各區間抓取到的平均買超成本，避免網頁解析異常導致斷頭價偏離真實區間。
         """
     )
