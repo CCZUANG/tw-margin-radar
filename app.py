@@ -1,4 +1,5 @@
 import io
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -13,7 +14,7 @@ st.set_page_config(
     page_title="台股分點融資斷頭雷達 | Streamlit",
     page_icon="📡",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # -----------------------------------------------------------------------------
@@ -73,6 +74,11 @@ HEADERS = {
     )
 }
 
+PLOTLY_MOBILE_CONFIG = {
+    "displayModeBar": False,
+    "scrollZoom": False,
+}
+
 
 def _parse_float(val: object) -> Optional[float]:
     s = str(val or "").replace(",", "").strip()
@@ -84,60 +90,93 @@ def _parse_float(val: object) -> Optional[float]:
         return None
 
 
-@st.cache_data(ttl=600)
-def fetch_tw_stock_latest_close(stock_id: str) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+@st.cache_data(ttl=1800)
+def load_all_tw_stocks() -> List[dict]:
     """
-    Fetch latest closing price, company name, and market ('上市' or '上櫃')
-    from TWSE OpenAPI (listed) and TPEx OpenAPI (OTC). Both are free and keyless.
+    Load all TWSE (上市) and TPEx (上櫃) stock codes, company names, and latest closing prices.
     """
-    code = stock_id.strip()
+    catalog: List[dict] = []
+    seen = set()
 
-    # 1. Try TWSE OpenAPI (上市)
+    # 1. TWSE OpenAPI (上市)
     try:
-        twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        resp = requests.get(twse_url, headers=HEADERS, timeout=10)
+        resp = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=HEADERS, timeout=10)
         resp.raise_for_status()
         for row in resp.json():
-            if str(row.get("Code", "")).strip() == code:
-                price = _parse_float(row.get("ClosingPrice"))
-                name = str(row.get("Name", "")).strip()
-                if price is not None:
-                    return price, name, "上市"
+            code = str(row.get("Code", "")).strip()
+            name = str(row.get("Name", "")).strip()
+            price = _parse_float(row.get("ClosingPrice"))
+            if code and name and code not in seen:
+                seen.add(code)
+                catalog.append({"code": code, "name": name, "market": "上市", "close": price})
     except Exception:
         pass
 
-    # 2. Try TPEx OpenAPI (上櫃)
+    # 2. TPEx OpenAPI (上櫃)
     try:
-        tpex_url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
-        resp = requests.get(tpex_url, headers=HEADERS, timeout=12)
+        resp = requests.get(
+            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+            headers=HEADERS,
+            timeout=12,
+        )
         resp.raise_for_status()
         for row in resp.json():
-            if str(row.get("SecuritiesCompanyCode", "")).strip() == code:
-                price = _parse_float(row.get("Close"))
-                name = str(row.get("CompanyName", "")).strip()
-                if price is not None:
-                    return price, name, "上櫃"
+            code = str(row.get("SecuritiesCompanyCode", "")).strip()
+            name = str(row.get("CompanyName", "")).strip()
+            price = _parse_float(row.get("Close"))
+            if code and name and code not in seen:
+                seen.add(code)
+                catalog.append({"code": code, "name": name, "market": "上櫃", "close": price})
     except Exception:
         pass
 
-    return None, None, None
+    # Ensure demo stocks are always present as fallback
+    for code, info in DEMO_STOCKS.items():
+        if code not in seen:
+            catalog.append(
+                {"code": code, "name": info["name"], "market": info["market"], "close": info["close"]}
+            )
+
+    return catalog
 
 
-@st.cache_data(ttl=600)
-def fetch_fubon_dj_branches(stock_id: str, est_buy_price: float) -> Tuple[pd.DataFrame, str]:
-    """
-    Fetch free broker net-buy table from Fubon e-broker DJ portal (公開免費網頁).
-    Note: DJ page provides 買進/賣出/買超張數; est_buy_price is used as initial cost
-    which can be edited directly in the table.
-    """
-    url = f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm?a={stock_id}&e="
-    resp = requests.get(url, headers=HEADERS, timeout=12)
-    resp.raise_for_status()
-    resp.encoding = resp.apparent_encoding or "big5"
+def resolve_stock_query(query: str, catalog: List[dict]) -> List[dict]:
+    """Match user query by exact stock code, exact name, or substring."""
+    q = query.strip()
+    if not q:
+        return [c for c in catalog if c["code"] == "2330"] or catalog[:1]
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    # Support "2330 台積電" format
+    first_token = q.split()[0]
+
+    exact_code = [c for c in catalog if c["code"].lower() == first_token.lower()]
+    if exact_code:
+        return exact_code
+
+    exact_name = [c for c in catalog if c["name"].lower() == q.lower()]
+    if exact_name:
+        return exact_name
+
+    partial = [
+        c for c in catalog
+        if q.lower() in c["code"].lower() or q.lower() in c["name"].lower()
+    ]
+    return partial[:20]
+
+
+def _parse_fubon_dj_page(html_text: str, fallback_price: float) -> Tuple[List[dict], float]:
+    """Parse a single Fubon DJ zco.djhtm page for net-buy branches and平均買超成本."""
+    soup = BeautifulSoup(html_text, "lxml")
+    page_text = soup.get_text(" ", strip=True)
+
+    avg_cost = fallback_price
+    m = re.search(r"平均買超成本\s*([\d,]+\.\d+|[\d,]+)", page_text)
+    if m:
+        parsed = _parse_float(m.group(1))
+        if parsed and parsed > 0:
+            avg_cost = parsed
+
     rows: List[dict] = []
-
     for tr in soup.find_all("tr"):
         tds = [td.get_text(strip=True) for td in tr.find_all("td")]
         if len(tds) >= 5:
@@ -154,16 +193,86 @@ def fetch_fubon_dj_branches(stock_id: str, est_buy_price: float) -> Tuple[pd.Dat
                             "分點名稱": broker,
                             "買進張數": buy_lots,
                             "賣出張數": sell_lots,
-                            "買進均價": est_buy_price,
+                            "買超張數": net_lots,
                         }
                     )
             except ValueError:
                 continue
 
-    if not rows:
+    return rows, avg_cost
+
+
+@st.cache_data(ttl=600)
+def fetch_fubon_dj_branches(stock_id: str, fallback_price: float, lookback_days: int = 5) -> Tuple[pd.DataFrame, str]:
+    """
+    Fetch recent N trading days of broker net-buy tables from Fubon DJ (公開免費網頁)
+    and compute each broker branch's volume-weighted average buy cost across those days.
+    """
+    agg: Dict[str, dict] = {}
+    days_found = 0
+    cursor = datetime.now()
+    checked = 0
+
+    while days_found < lookback_days and checked < lookback_days * 3:
+        checked += 1
+        if cursor.weekday() < 5:
+            d_str = f"{cursor.year}-{cursor.month}-{cursor.day}"
+            url = f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm?a={stock_id}&e={d_str}&f={d_str}"
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=10)
+                if resp.status_code == 200:
+                    resp.encoding = resp.apparent_encoding or "big5"
+                    day_rows, day_cost = _parse_fubon_dj_page(resp.text, fallback_price)
+                    if day_rows:
+                        days_found += 1
+                        for r in day_rows:
+                            name = r["分點名稱"]
+                            if name not in agg:
+                                agg[name] = {"buy": 0, "sell": 0, "value": 0.0}
+                            agg[name]["buy"] += r["買進張數"]
+                            agg[name]["sell"] += r["賣出張數"]
+                            agg[name]["value"] += r["買進張數"] * day_cost
+            except Exception:
+                pass
+        cursor -= timedelta(days=1)
+
+    if agg:
+        result_rows = []
+        for name, v in agg.items():
+            if v["buy"] - v["sell"] > 0 and v["buy"] > 0:
+                result_rows.append(
+                    {
+                        "分點名稱": name,
+                        "買進張數": v["buy"],
+                        "賣出張數": v["sell"],
+                        "買進均價": round(v["value"] / v["buy"], 2),
+                    }
+                )
+        if result_rows:
+            df = pd.DataFrame(result_rows).sort_values(by="買進張數", ascending=False).head(30)
+            return df.reset_index(drop=True), f"近 {days_found} 個交易日加權"
+
+    # Fallback: default single summary page
+    default_url = f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm?a={stock_id}&e="
+    resp = requests.get(default_url, headers=HEADERS, timeout=12)
+    resp.raise_for_status()
+    resp.encoding = resp.apparent_encoding or "big5"
+    day_rows, day_cost = _parse_fubon_dj_page(resp.text, fallback_price)
+    if not day_rows:
         raise ValueError("無法從免費券商網頁解析到買超分點，可能為非交易日、無分點明細或連線受限。")
 
-    return pd.DataFrame(rows), url
+    df = pd.DataFrame(
+        [
+            {
+                "分點名稱": r["分點名稱"],
+                "買進張數": r["買進張數"],
+                "賣出張數": r["賣出張數"],
+                "買進均價": round(day_cost, 2),
+            }
+            for r in day_rows
+        ]
+    )
+    return df, "單日彙總"
 
 
 @st.cache_data(ttl=600)
@@ -259,9 +368,44 @@ def calculate_margin_table(
 
 
 # -----------------------------------------------------------------------------
-# Sidebar Controls
+# Main Page Header & Search Bar (Supports Stock Code or Company Name)
 # -----------------------------------------------------------------------------
-st.sidebar.title("⚙️ 查詢與參數設定")
+st.title("📡 台股分點融資斷頭雷達")
+
+catalog = load_all_tw_stocks()
+
+search_col1, search_col2 = st.columns([3, 2])
+with search_col1:
+    user_query = st.text_input(
+        "🔍 搜尋個股（支援輸入股號或公司名稱，例如：2330、台積電、群聯）",
+        value="2330",
+        placeholder="輸入股號或公司名稱後按 Enter...",
+    )
+
+matches = resolve_stock_query(user_query, catalog)
+if not matches:
+    st.warning(f"找不到符合「{user_query}」的上市櫃個股，已改顯示 2330 台積電。")
+    selected_stock = {"code": "2330", "name": "台積電", "market": "上市", "close": 1035.0}
+elif len(matches) == 1:
+    selected_stock = matches[0]
+    with search_col2:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        st.success(f"已鎖定：**{selected_stock['code']} {selected_stock['name']}** ({selected_stock['market']})")
+else:
+    options_map = {f"{m['code']} {m['name']} ({m['market']})": m for m in matches}
+    with search_col2:
+        chosen_label = st.selectbox("找到多筆符合標的，請選擇：", list(options_map.keys()))
+        selected_stock = options_map[chosen_label]
+
+stock_id = selected_stock["code"]
+detected_name = selected_stock["name"]
+detected_market = selected_stock["market"]
+detected_close = selected_stock["close"]
+
+# -----------------------------------------------------------------------------
+# Sidebar Advanced Settings
+# -----------------------------------------------------------------------------
+st.sidebar.title("⚙️ 進階參數設定")
 
 data_source = st.sidebar.radio(
     "資料來源",
@@ -269,25 +413,13 @@ data_source = st.sidebar.radio(
     index=0,
 )
 
-stock_id = st.sidebar.text_input("股票代碼（上市或上櫃皆可）", value="2330").strip()
-
-# Pre-resolve market & closing price when in live mode so margin ratio auto-adapts
-detected_close: Optional[float] = None
-detected_name: Optional[str] = None
-detected_market: Optional[str] = None
-if data_source.startswith("免費即時") and stock_id:
-    detected_close, detected_name, detected_market = fetch_tw_stock_latest_close(stock_id)
+lookback_days = st.sidebar.slider("分點成本統計天數（免費即時模式）", min_value=1, max_value=10, value=5, step=1)
 
 market_options = ["自動偵測", "上市 (60%)", "上櫃 (50%)", "自訂"]
 market_type = st.sidebar.selectbox("市場別 / 融資成數預設", market_options, index=0)
 
 if market_type == "自動偵測":
-    if detected_market == "上櫃":
-        default_ratio = 50
-    elif detected_market == "上市":
-        default_ratio = 60
-    else:
-        default_ratio = DEMO_STOCKS.get(stock_id, {}).get("default_ratio", 60)
+    default_ratio = 50 if detected_market == "上櫃" else 60
 elif market_type.startswith("上市"):
     default_ratio = 60
 elif market_type.startswith("上櫃"):
@@ -301,7 +433,7 @@ maint_threshold_pct = st.sidebar.number_input("斷頭/追繳維持率門檻 (%)"
 # Load Data based on selected source
 raw_df = pd.DataFrame()
 base_price = 100.0
-stock_label = stock_id
+stock_label = f"{stock_id} {detected_name} ({detected_market})".strip()
 source_note = ""
 
 if data_source.startswith("免費即時"):
@@ -312,14 +444,12 @@ if data_source.startswith("免費即時"):
         step=1.0,
     )
     base_price = float(detected_close) if detected_close else fallback_close
-    market_tag = f" ({detected_market})" if detected_market else ""
-    stock_label = f"{stock_id} {detected_name or ''}{market_tag}".strip()
     try:
-        raw_df, fetched_url = fetch_fubon_dj_branches(stock_id, base_price)
+        raw_df, window_label = fetch_fubon_dj_branches(stock_id, base_price, lookback_days=lookback_days)
         price_src = "櫃買中心 OpenAPI" if detected_market == "上櫃" else "證交所 OpenAPI"
         source_note = (
-            f"已從**{price_src}**取得收盤價 `{base_price:,.1f} 元`，並從免費公開分點網頁抓取最新買超分點"
-            "（初始買進均價預設帶入基準價，你可在下方表格直接微調各分點實際成本）。"
+            f"已從**{price_src}**取得收盤價 `{base_price:,.1f} 元`，並彙總**{window_label}**各日分點買進張數與每日平均買超成本"
+            "（若仍需微調個別分點成本，可在下方表格直接編輯）。"
         )
     except Exception as e:
         st.warning(f"免費即時抓取失敗（{e}），已自動切換為範例數據。")
@@ -331,8 +461,7 @@ if data_source.startswith("免費即時"):
 elif data_source.startswith("範例"):
     preset = DEMO_STOCKS.get(stock_id, DEMO_STOCKS["2330"])
     if stock_id not in DEMO_STOCKS:
-        stock_id = "2330"
-    stock_label = f"{stock_id} {preset['name']} ({preset['market']})"
+        stock_label = f"2330 {DEMO_STOCKS['2330']['name']} (範例)"
     base_price = preset["close"]
     raw_df = pd.DataFrame(preset["branches"])
     source_note = "目前顯示內建範例模擬數據，可供直接體驗壓力測試。"
@@ -365,9 +494,8 @@ else:
         base_price = DEMO_STOCKS["2330"]["close"]
 
 # -----------------------------------------------------------------------------
-# Main UI
+# Dashboard Body
 # -----------------------------------------------------------------------------
-st.title("📡 台股分點融資斷頭雷達")
 st.caption(f"查詢標的：**{stock_label}** ｜ 基準價：**{base_price:,.1f} 元** ｜ 融資成數：**{margin_ratio_pct}%** ｜ 追繳門檻：**{maint_threshold_pct}%**")
 if source_note:
     st.info(source_note)
@@ -380,7 +508,6 @@ sim_price = st.slider(
     step=0.5 if base_price < 200 else 1.0,
 )
 
-# Editable table so users can tweak any broker's average buy price
 with st.expander("✏️ 編輯或微調分點買進均價 / 張數（即時重算）", expanded=False):
     edited_df = st.data_editor(raw_df, num_rows="dynamic", use_container_width=True)
 
@@ -401,23 +528,52 @@ c2.metric("加權平均斷頭價", f"{avg_call_price:,.1f} 元")
 c3.metric("已破斷頭線分點", f"{len(danger_df)} / {len(calc_df)} 家")
 c4.metric("潛在斷頭賣壓", f"{danger_lots:,} 張", f"佔追蹤買超 {(danger_lots / total_lots * 100):.1f}%" if total_lots else "0.0%")
 
-# Charts
+# Charts (Mobile-friendly: dragmode=False & fixedrange=True prevent accidental zoom/pan on touchscreens)
 col_left, col_right = st.columns(2)
 
 with col_left:
     st.subheader("各價位區間斷頭賣壓牆")
     if not calc_df.empty:
-        fig_wall = px.histogram(
-            calc_df,
-            x="斷頭價位(元)",
-            y="淨買超(張)",
-            nbins=6,
-            color_discrete_sequence=["#38bdf8"],
-            labels={"斷頭價位(元)": "斷頭價區間 (元)", "淨買超(張)": "潛在斷頭張數"},
+        min_call = float(calc_df["斷頭價位(元)"].min())
+        max_call = float(calc_df["斷頭價位(元)"].max())
+        if max_call - min_call < 0.5:
+            wall_df = pd.DataFrame(
+                {
+                    "斷頭價區間": [f"{min_call:,.1f} 元"],
+                    "潛在斷頭張數": [int(calc_df["淨買超(張)"].sum())],
+                    "狀態": ["已破斷頭線" if sim_price < min_call else "安全/未觸及"],
+                }
+            )
+        else:
+            bins = pd.cut(calc_df["斷頭價位(元)"], bins=5)
+            grouped_wall = calc_df.groupby(bins, observed=False)["淨買超(張)"].sum().reset_index()
+            wall_df = pd.DataFrame(
+                {
+                    "斷頭價區間": [f"{iv.left:,.0f}~{iv.right:,.0f}" for iv in grouped_wall["斷頭價位(元)"]],
+                    "潛在斷頭張數": grouped_wall["淨買超(張)"].astype(int),
+                    "狀態": [
+                        "已破斷頭線" if sim_price <= iv.right else "安全/未觸及"
+                        for iv in grouped_wall["斷頭價位(元)"]
+                    ],
+                }
+            )
+
+        fig_wall = px.bar(
+            wall_df,
+            x="斷頭價區間",
+            y="潛在斷頭張數",
+            color="狀態",
+            color_discrete_map={"已破斷頭線": "#f43f5e", "安全/未觸及": "#38bdf8"},
         )
-        fig_wall.add_vline(x=sim_price, line_dash="dash", line_color="#f43f5e", annotation_text=f"模擬現價 {sim_price:.1f}")
-        fig_wall.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig_wall, use_container_width=True)
+        fig_wall.update_layout(
+            height=340,
+            margin=dict(l=10, r=10, t=30, b=10),
+            dragmode=False,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            xaxis=dict(fixedrange=True, title="斷頭價位區間 (元)"),
+            yaxis=dict(fixedrange=True, title="淨買超 (張)"),
+        )
+        st.plotly_chart(fig_wall, use_container_width=True, config=PLOTLY_MOBILE_CONFIG)
 
 with col_right:
     st.subheader("前十大買超分點：買進均價 vs 斷頭價")
@@ -427,8 +583,16 @@ with col_right:
         fig_bar.add_trace(go.Bar(name="買進均價", x=top10["分點名稱"], y=top10["買進均價"], marker_color="#64748b"))
         fig_bar.add_trace(go.Bar(name="斷頭價位", x=top10["分點名稱"], y=top10["斷頭價位(元)"], marker_color="#f59e0b"))
         fig_bar.add_hline(y=sim_price, line_dash="dash", line_color="#38bdf8", annotation_text="模擬現價")
-        fig_bar.update_layout(barmode="group", height=340, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig_bar, use_container_width=True)
+        fig_bar.update_layout(
+            barmode="group",
+            height=340,
+            margin=dict(l=10, r=10, t=30, b=10),
+            dragmode=False,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            xaxis=dict(fixedrange=True),
+            yaxis=dict(fixedrange=True),
+        )
+        st.plotly_chart(fig_bar, use_container_width=True, config=PLOTLY_MOBILE_CONFIG)
 
 # Detailed Table
 st.subheader("📋 分點融資斷頭風險明細")
@@ -439,6 +603,6 @@ with st.expander("📐 計算公式與資料限制說明"):
         """
         - **單筆融資維持率** $= \\frac{\\text{目前股價}}{\\text{買進均價} \\times \\text{融資成數}} \\times 100\\%$
         - **斷頭／追繳價位** $= \\text{買進均價} \\times \\text{融資成數} \\times \\text{維持率門檻（預設 } 130\\%\\text{）}$
-        - **實務提醒**：證交所與櫃買中心並未公開各券商分點的實際融資使用比例，本工具係以設定之融資成數推算理論追繳價位，實際斷頭與否以投資人整戶擔保維持率為準。
+        - **實務提醒**：證交所與櫃買中心並未公開各券商分點的實際融資使用比例，本工具係以多日分點買進張數搭配當日平均買超成本推算加權成本，實際斷頭與否仍以投資人整戶擔保維持率為準。
         """
     )
