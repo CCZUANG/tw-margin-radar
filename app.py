@@ -6,12 +6,13 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
 st.set_page_config(
-    page_title="台股個股融資維持率與分點斷頭雷達",
+    page_title="台股分點融資斷頭雷達",
     page_icon="📡",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -24,7 +25,7 @@ st.markdown(
     """
     <style>
       .block-container {
-        padding-top: 1.1rem;
+        padding-top: 1.2rem;
         padding-bottom: 2.5rem;
         max-width: 1200px;
       }
@@ -33,7 +34,7 @@ st.markdown(
         border: 1px solid #1e293b;
         border-radius: 16px;
         padding: 18px 22px;
-        margin-bottom: 14px;
+        margin-bottom: 16px;
       }
       .hero-top {
         display: flex;
@@ -51,7 +52,7 @@ st.markdown(
       .stock-sub {
         font-size: 0.82rem;
         color: #94a3b8;
-        margin-top: 3px;
+        margin-top: 2px;
       }
       .price-pill {
         text-align: right;
@@ -67,40 +68,6 @@ st.markdown(
         font-size: 0.75rem;
         color: #94a3b8;
       }
-      .official-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-        gap: 12px;
-        margin-bottom: 18px;
-      }
-      .official-card {
-        background: #111827;
-        border: 1px solid #1f2937;
-        border-radius: 14px;
-        padding: 14px 16px;
-      }
-      .official-card.border-danger { border-color: #f43f5e; background: rgba(244, 63, 94, 0.08); }
-      .official-card.border-warn   { border-color: #f59e0b; background: rgba(245, 158, 11, 0.08); }
-      .official-card.border-safe   { border-color: #10b981; background: rgba(16, 185, 129, 0.07); }
-      .o-label {
-        font-size: 0.78rem;
-        color: #94a3b8;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-      }
-      .o-val {
-        font-size: 1.55rem;
-        font-weight: 800;
-        margin-top: 6px;
-        font-variant-numeric: tabular-nums;
-      }
-      .o-sub {
-        font-size: 0.78rem;
-        color: #cbd5e1;
-        margin-top: 4px;
-        font-variant-numeric: tabular-nums;
-      }
       .risk-card {
         background: #111827;
         border: 1px solid #1f2937;
@@ -113,12 +80,12 @@ st.markdown(
         display: flex;
         justify-content: space-between;
         align-items: baseline;
-        margin-bottom: 10px;
+        margin-bottom: 12px;
         border-bottom: 1px solid #1f2937;
         padding-bottom: 8px;
       }
       .risk-card-title {
-        font-size: 1.02rem;
+        font-size: 1.05rem;
         font-weight: 700;
         color: #f1f5f9;
       }
@@ -126,26 +93,24 @@ st.markdown(
         font-size: 0.74rem;
         color: #94a3b8;
       }
-      .danger-count-bar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        background: #0f172a;
-        border: 1px solid #1e293b;
-        border-radius: 10px;
-        padding: 8px 12px;
-        margin-bottom: 10px;
-        font-size: 0.84rem;
-      }
       .stage-box {
         border-radius: 12px;
         padding: 12px 14px;
         margin-bottom: 10px;
         border-left: 4px solid #334155;
       }
-      .stage-danger { background: rgba(244, 63, 94, 0.12); border-left-color: #f43f5e; }
-      .stage-warn   { background: rgba(245, 158, 11, 0.12); border-left-color: #f59e0b; }
-      .stage-safe   { background: rgba(16, 185, 129, 0.10); border-left-color: #10b981; }
+      .stage-danger {
+        background: rgba(244, 63, 94, 0.12);
+        border-left-color: #f43f5e;
+      }
+      .stage-warn {
+        background: rgba(245, 158, 11, 0.12);
+        border-left-color: #f59e0b;
+      }
+      .stage-safe {
+        background: rgba(16, 185, 129, 0.10);
+        border-left-color: #10b981;
+      }
       .stage-label {
         font-size: 0.76rem;
         color: #cbd5e1;
@@ -154,21 +119,18 @@ st.markdown(
         align-items: center;
       }
       .stage-main {
-        font-size: 1.32rem;
+        font-size: 1.38rem;
         font-weight: 800;
         margin-top: 4px;
         font-variant-numeric: tabular-nums;
       }
-      .broker-highlight {
-        font-size: 1.02rem;
-        font-weight: 700;
-        color: #f8fafc;
-        margin-top: 5px;
-      }
+      .text-danger { color: #fb7185; }
+      .text-warn   { color: #fbbf24; }
+      .text-safe   { color: #34d399; }
       .stage-sub {
-        font-size: 0.80rem;
+        font-size: 0.78rem;
         color: #94a3b8;
-        margin-top: 4px;
+        margin-top: 3px;
         font-variant-numeric: tabular-nums;
       }
       .card-footer {
@@ -179,10 +141,6 @@ st.markdown(
         justify-content: space-between;
         font-variant-numeric: tabular-nums;
       }
-      .text-danger { color: #fb7185; }
-      .text-warn   { color: #fbbf24; }
-      .text-safe   { color: #34d399; }
-      .text-sky    { color: #38bdf8; }
       .badge {
         display: inline-block;
         padding: 2px 8px;
@@ -262,7 +220,7 @@ PLOTLY_MOBILE_CONFIG = {
 
 
 def _parse_float(val: object) -> Optional[float]:
-    s = str(val or "").replace(",", "").replace("%", "").strip()
+    s = str(val or "").replace(",", "").strip()
     if not s or s in ("--", "---", "----", "N/A"):
         return None
     try:
@@ -326,55 +284,6 @@ def load_all_tw_stocks() -> List[dict]:
     return catalog
 
 
-@st.cache_data(ttl=1800)
-def fetch_market_margin_maintenance() -> Optional[dict]:
-    """
-    Automatically fetch latest Taiwan market-wide margin maintenance ratio (%)
-    and margin balance change (億元) from public KGI market overview page.
-    """
-    url = (
-        "https://www.kgi.com.tw/zh-tw/product-market/stock-market-overview/"
-        "tw-stock-market/tw-stock-market-detail"
-        "?a=B658010E71E243C4A1D6B5F7BE914BDC&b=5D48401A7CE148CD8ABAC965F9B5AFBF"
-    )
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        if resp.status_code != 200:
-            return None
-        soup = BeautifulSoup(resp.text, "lxml")
-        text = soup.get_text(" ", strip=True)
-
-        # Try matching latest summary text: e.g. "2026/11/19 融資維持率 147.90% 融資餘額 4,843.68億元"
-        m_ratio = re.search(r"融資維持率\s*([\d.]+)\s*%", text)
-        m_bal = re.search(r"融資餘額\s*([\d,]+\.\d+|[\d,]+)\s*億", text)
-        m_date = re.search(r"(\d{4}/\d{1,2}/\d{1,2})\s*融資維持率", text)
-        m_chg = re.search(r"融資增減\s*([+\-]?[\d,]+\.\d+|[+\-]?[\d,]+)\s*億", text)
-
-        if m_ratio:
-            return {
-                "date": m_date.group(1) if m_date else "最新交易日",
-                "ratio_pct": float(m_ratio.group(1)),
-                "balance_yi": m_bal.group(1) if m_bal else "--",
-                "change_yi": m_chg.group(1) if m_chg else "--",
-            }
-
-        # Fallback: parse HTML table rows (日期 | 融資增減(億) | 融資維持率(%))
-        for tr in soup.find_all("tr"):
-            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(tds) >= 3 and re.match(r"^\d{1,2}/\d{1,2}$", tds[0]):
-                ratio_v = _parse_float(tds[2])
-                if ratio_v and 100 <= ratio_v <= 250:
-                    return {
-                        "date": tds[0],
-                        "ratio_pct": ratio_v,
-                        "balance_yi": "--",
-                        "change_yi": tds[1],
-                    }
-    except Exception:
-        pass
-    return None
-
-
 def resolve_stock_query(query: str, catalog: List[dict]) -> List[dict]:
     q = query.strip()
     if not q:
@@ -393,11 +302,36 @@ def resolve_stock_query(query: str, catalog: List[dict]) -> List[dict]:
     return partial[:20]
 
 
+@st.cache_data(ttl=120)
+def fetch_yahoo_latest_price(stock_id: str, market: str) -> Tuple[Optional[float], Optional[str]]:
+    """Fetch freshest real-time/latest closing price from Yahoo Finance Taiwan (.TW / .TWO)."""
+    suffixes = [".TWO", ".TW"] if market == "上櫃" else [".TW", ".TWO"]
+    for sfx in suffixes:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{sfx}?interval=1d&range=5d"
+            resp = requests.get(url, headers=HEADERS, timeout=8)
+            if resp.status_code != 200:
+                continue
+            meta = resp.json()["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice") or meta.get("previousClose")
+            ts = meta.get("regularMarketTime")
+            if price and float(price) > 0:
+                dt_str = (
+                    (datetime.utcfromtimestamp(int(ts)) + timedelta(hours=8)).strftime("%Y/%m/%d")
+                    if ts
+                    else "最新"
+                )
+                return float(price), dt_str
+        except Exception:
+            continue
+    return None, None
+
+
 @st.cache_data(ttl=1800)
 def fetch_official_daily_closes(stock_id: str, market: str) -> pd.DataFrame:
     rows = []
     now = datetime.now()
-    for m_offset in range(6):
+    for m_offset in (0, 1, 2):
         target = (now.replace(day=1) - timedelta(days=m_offset * 28)).replace(day=1)
         try:
             if market == "上市":
@@ -431,137 +365,33 @@ def fetch_official_daily_closes(stock_id: str, market: str) -> pd.DataFrame:
     return pd.DataFrame(rows).drop_duplicates("日期").sort_values("日期").reset_index(drop=True)
 
 
-def _parse_margin_table(html_text: str) -> List[dict]:
-    soup = BeautifulSoup(html_text, "lxml")
-    rows = []
-    for tr in soup.find_all("tr"):
-        tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-        if len(tds) >= 8:
-            dt = _roc_to_date(tds[0])
-            if dt is None:
-                continue
-            m_buy = _parse_float(tds[1])
-            m_sell = _parse_float(tds[2])
-            m_repay = _parse_float(tds[3])
-            bal = _parse_float(tds[4])
-            chg = _parse_float(tds[5])
-            usage = _parse_float(tds[7])
-            if bal is not None and chg is not None:
-                rows.append(
-                    {
-                        "日期": dt,
-                        "融資買進": int(m_buy or 0),
-                        "融資賣出": int(m_sell or 0),
-                        "現償": int(m_repay or 0),
-                        "融資餘額": int(bal),
-                        "融資增減": int(chg),
-                        "使用率(%)": float(usage or 0.0),
-                    }
-                )
-    return rows
-
-
 @st.cache_data(ttl=900)
-def fetch_margin_history(stock_id: str, trading_days: int = 120) -> pd.DataFrame:
-    """
-    Fetch up to ~120 trading days (~180 calendar days) of full margin purchase/sell/
-    cash-repay/balance/usage from Fubon DJ zcn.djhtm to minimize initial cost bias.
-    """
-    end_dt = date.today()
-    start_dt = end_dt - timedelta(days=int(trading_days * 1.55))
-    c_str = f"{start_dt.year}-{start_dt.month}-{start_dt.day}"
-    d_str = f"{end_dt.year}-{end_dt.month}-{end_dt.day}"
+def fetch_margin_history(stock_id: str) -> pd.DataFrame:
+    url = f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zcn/zcn.djhtm?a={stock_id}&b=3"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        resp.encoding = resp.apparent_encoding or "big5"
+        soup = BeautifulSoup(resp.text, "lxml")
 
-    candidate_urls = [
-        f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zcn/zcn.djhtm?a={stock_id}&c={c_str}&d={d_str}",
-        f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zcn/zcn.djhtm?a={stock_id}&e={c_str}&f={d_str}",
-        f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zcn/zcn.djhtm?a={stock_id}&b=3",
-    ]
+        rows = []
+        for tr in soup.find_all("tr"):
+            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if len(tds) >= 6:
+                dt = _roc_to_date(tds[0])
+                if dt is None:
+                    continue
+                bal = _parse_float(tds[4])
+                chg = _parse_float(tds[5])
+                if bal is not None and chg is not None:
+                    rows.append({"日期": dt, "融資餘額": int(bal), "融資增減": int(chg)})
 
-    best_rows: List[dict] = []
-    for url in candidate_urls:
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=12)
-            if resp.status_code != 200:
-                continue
-            resp.encoding = resp.apparent_encoding or "big5"
-            parsed = _parse_margin_table(resp.text)
-            if len(parsed) > len(best_rows):
-                best_rows = parsed
-            if len(best_rows) >= 60:
-                break
-        except Exception:
-            continue
-
-    if not best_rows:
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows).sort_values("日期").reset_index(drop=True)
+    except Exception:
         return pd.DataFrame()
-    df = pd.DataFrame(best_rows).drop_duplicates("日期").sort_values("日期").reset_index(drop=True)
-    return df.tail(trading_days).reset_index(drop=True)
-
-
-def compute_stock_margin_maintenance(
-    margin_df: pd.DataFrame,
-    price_df: pd.DataFrame,
-    current_price: float,
-    margin_ratio_pct: float,
-    maint_threshold_pct: float,
-) -> Optional[dict]:
-    """
-    Compute stock-level margin maintenance ratio using actual daily Margin Purchase / Sell
-    aligned with official daily closing prices (moving weighted-average cost model).
-    Completely free of cash/foreign-investor distortion from broker branch data.
-    """
-    if margin_df.empty or current_price <= 0:
-        return None
-
-    df = margin_df.copy()
-    if not price_df.empty:
-        df = pd.merge(df, price_df, on="日期", how="left")
-        df["收盤價"] = df["收盤價"].ffill().bfill().fillna(current_price)
-    else:
-        df["收盤價"] = current_price
-
-    # Initialize rolling average cost from the oldest balance in the window
-    avg_cost = float(df["收盤價"].iloc[0])
-    bal = float(df["融資餘額"].iloc[0])
-    ratio = margin_ratio_pct / 100.0
-    threshold = maint_threshold_pct / 100.0
-
-    maint_series = []
-    for _, row in df.iterrows():
-        p = float(row["收盤價"])
-        m_buy = float(row["融資買進"])
-        m_out = float(row["融資賣出"] + row["現償"])
-        end_bal = float(row["融資餘額"])
-
-        # Reduce by sells/repayments at current avg_cost, then blend new margin buys at day's close
-        rem_bal = max(0.0, bal - m_out)
-        new_total = rem_bal + m_buy
-        if new_total > 0:
-            avg_cost = (rem_bal * avg_cost + m_buy * p) / new_total
-        bal = end_bal if end_bal > 0 else new_total
-
-        day_maint = (p / (avg_cost * ratio)) * 100.0 if (avg_cost > 0 and ratio > 0) else 0.0
-        maint_series.append(round(day_maint, 1))
-
-    df["推估融資維持率(%)"] = maint_series
-    latest_row = df.iloc[-1]
-    latest_bal = int(latest_row["融資餘額"])
-    latest_usage = float(latest_row["使用率(%)"])
-    latest_maint = (current_price / (avg_cost * ratio)) * 100.0 if (avg_cost > 0 and ratio > 0) else 0.0
-    call_price = avg_cost * ratio * threshold
-    drop_to_call_pct = ((call_price - current_price) / current_price) * 100.0
-
-    return {
-        "latest_date": latest_row["日期"],
-        "margin_balance": latest_bal,
-        "margin_usage_pct": latest_usage,
-        "est_avg_cost": round(avg_cost, 2),
-        "est_maint_pct": round(latest_maint, 1),
-        "est_call_price": round(call_price, 2),
-        "drop_to_call_pct": round(drop_to_call_pct, 1),
-        "history_df": df,
-    }
 
 
 def detect_turning_points(margin_df: pd.DataFrame) -> dict:
@@ -574,17 +404,16 @@ def detect_turning_points(margin_df: pd.DataFrame) -> dict:
     if margin_df.empty:
         return info
 
-    recent_df = margin_df.tail(40).reset_index(drop=True)
-    latest_dt = recent_df["日期"].iloc[-1]
+    latest_dt = margin_df["日期"].iloc[-1]
     info["latest_date"] = latest_dt
 
-    min_idx = recent_df["融資餘額"].idxmin()
-    min_bal_dt = recent_df.loc[min_idx, "日期"]
+    min_idx = margin_df["融資餘額"].idxmin()
+    min_bal_dt = margin_df.loc[min_idx, "日期"]
     if (latest_dt - min_bal_dt).days < 7:
         min_bal_dt = latest_dt - timedelta(days=14)
     info["min_bal_date"] = min_bal_dt
 
-    earlier_df = recent_df.iloc[:-3] if len(recent_df) > 6 else recent_df
+    earlier_df = margin_df.iloc[:-3] if len(margin_df) > 6 else margin_df
     pos_df = earlier_df[earlier_df["融資增減"] > 0]
     if not pos_df.empty:
         spike_idx = pos_df["融資增減"].idxmax()
@@ -733,6 +562,65 @@ def fetch_fubon_dj_range_weighted(
     return df, "單日預設"
 
 
+@st.cache_data(ttl=600)
+def fetch_finmind_branches(stock_id: str, token: str, days: int = 20) -> Tuple[pd.DataFrame, float]:
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=max(days * 2, 20))
+    fmt = "%Y-%m-%d"
+
+    price_resp = requests.get(
+        "https://api.finmindtrade.com/api/v4/data",
+        params={
+            "dataset": "TaiwanStockPrice",
+            "data_id": stock_id,
+            "start_date": start_dt.strftime(fmt),
+            "end_date": end_dt.strftime(fmt),
+            "token": token,
+        },
+        timeout=15,
+    ).json()
+
+    chip_resp = requests.get(
+        "https://api.finmindtrade.com/api/v4/data",
+        params={
+            "dataset": "TaiwanStockTradingDailyReport",
+            "data_id": stock_id,
+            "start_date": start_dt.strftime(fmt),
+            "end_date": end_dt.strftime(fmt),
+            "token": token,
+        },
+        timeout=20,
+    ).json()
+
+    if chip_resp.get("status") != 200 or not chip_resp.get("data"):
+        raise ValueError(chip_resp.get("msg", "FinMind 查無分點資料或 Token 權限不足（需 Sponsor 方案）"))
+
+    latest_close = 100.0
+    if price_resp.get("data"):
+        latest_close = float(price_resp["data"][-1]["close"])
+
+    df_chip = pd.DataFrame(chip_resp["data"])
+    df_chip["buy"] = pd.to_numeric(df_chip["buy"], errors="coerce").fillna(0)
+    df_chip["sell"] = pd.to_numeric(df_chip["sell"], errors="coerce").fillna(0)
+    df_chip["price"] = pd.to_numeric(df_chip["price"], errors="coerce").fillna(latest_close)
+    df_chip["buy_value"] = df_chip["buy"] * df_chip["price"]
+
+    grouped = (
+        df_chip.groupby("securities_trader", as_index=False)
+        .agg({"buy": "sum", "sell": "sum", "buy_value": "sum"})
+    )
+    grouped["買進張數"] = (grouped["buy"] / 1000).round(0).astype(int)
+    grouped["賣出張數"] = (grouped["sell"] / 1000).round(0).astype(int)
+    grouped = grouped[(grouped["買進張數"] - grouped["賣出張數"] > 0) & (grouped["buy"] > 0)].copy()
+    grouped["買進均價"] = (grouped["buy_value"] / grouped["buy"]).round(2)
+    grouped = grouped.rename(columns={"securities_trader": "分點名稱"})
+
+    result = grouped[["分點名稱", "買進張數", "賣出張數", "買進均價"]].sort_values(
+        by="買進張數", ascending=False
+    ).head(40)
+    return result.reset_index(drop=True), latest_close
+
+
 def calculate_margin_metrics(
     df: pd.DataFrame, current_price: float, margin_ratio_pct: float, maint_threshold_pct: float
 ) -> Tuple[pd.DataFrame, dict]:
@@ -751,6 +639,7 @@ def calculate_margin_metrics(
     out["斷頭價位(元)"] = (out["買進均價"] * ratio * threshold).round(2)
     denom = out["買進均價"] * ratio
     out["目前維持率(%)"] = ((current_price / denom.replace(0, pd.NA)) * 100).round(1)
+    # 負值 = 還需下跌多少 %；正值 = 已低於斷頭價多少 %
     out["距斷頭跌幅(%)"] = (((out["斷頭價位(元)"] - current_price) / current_price) * 100).round(1)
 
     def classify(m: float) -> str:
@@ -779,6 +668,7 @@ def calculate_margin_metrics(
             {
                 "價位區間": peak_label,
                 "中心價": min_call,
+                "距現價%": round(((min_call - current_price) / current_price) * 100, 1),
                 "潛在斷頭張數": peak_lots,
                 "風險等級": "已觸發斷頭" if current_price <= min_call else ("高危警戒" if first_drop_pct > -8 else "安全緩衝"),
             }
@@ -813,6 +703,7 @@ def calculate_margin_metrics(
                 {
                     "價位區間": tag,
                     "中心價": mid,
+                    "距現價%": round(drop_p, 1),
                     "潛在斷頭張數": lots,
                     "風險等級": lvl,
                 }
@@ -821,17 +712,10 @@ def calculate_margin_metrics(
     wall_df = pd.DataFrame(wall_rows).sort_values(by="中心價", ascending=True) if wall_rows else pd.DataFrame()
     peak_drop_pct = ((peak_trigger_price - current_price) / current_price) * 100.0
     total_lots = int(out["淨買超(張)"].sum())
-    danger_mask = out["目前維持率(%)"] < maint_threshold_pct
-    danger_count = int(danger_mask.sum())
-    danger_lots = int(out.loc[danger_mask, "淨買超(張)"].sum())
-    total_brokers = int(len(out))
     weighted_call = float((out["斷頭價位(元)"] * out["淨買超(張)"]).sum() / total_lots) if total_lots else 0.0
     weighted_buy = float((out["買進均價"] * out["淨買超(張)"]).sum() / total_lots) if total_lots else 0.0
 
     summary = {
-        "danger_count": danger_count,
-        "danger_lots": danger_lots,
-        "total_brokers": total_brokers,
         "first_broker": str(first_row["分點名稱"]),
         "first_price": first_price,
         "first_drop_pct": first_drop_pct,
@@ -847,6 +731,10 @@ def calculate_margin_metrics(
 
 
 def _stage_theme(drop_pct: float) -> Tuple[str, str, str, str]:
+    """
+    Return (box_class, text_class, badge_class, badge_text)
+    Red = already liquidated (>=0), Amber = danger within 8%, Green = safe buffer (>8% away).
+    """
     if drop_pct >= 0:
         return "stage-danger", "text-danger", "badge-danger", "🔴 已破斷頭線"
     if drop_pct > -8.0:
@@ -868,17 +756,13 @@ def render_risk_card(label: str, rng_str: str, summary: dict) -> str:
         </div>
         """
 
-    d_cnt = summary["danger_count"]
-    t_cnt = summary["total_brokers"]
-    d_lots = summary["danger_lots"]
-    d_color = "#fb7185" if d_cnt > 0 else "#34d399"
-    d_status_txt = f"{d_cnt} / {t_cnt} 家（{d_lots:,} 張）" if d_cnt > 0 else f"0 / {t_cnt} 家（尚未斷頭）"
-
+    # Stage 1: First liquidation
     f_drop = summary["first_drop_pct"]
     f_box, f_txt, f_bcls, f_btxt = _stage_theme(f_drop)
     f_headline = f"已跌破 {f_drop:.1f}%" if f_drop >= 0 else f"再跌 {abs(f_drop):.1f}% 開始斷頭"
     f_broker = html.escape(summary["first_broker"])
 
+    # Stage 2: Peak wave
     p_drop = summary["peak_drop_pct"]
     p_box, p_txt, p_bcls, p_btxt = _stage_theme(p_drop)
     p_headline = f"已引爆（破線 {p_drop:.1f}%）" if p_drop >= 0 else f"再跌 {abs(p_drop):.1f}% 爆發斷頭潮"
@@ -891,19 +775,13 @@ def render_risk_card(label: str, rng_str: str, summary: dict) -> str:
         <span class="risk-card-date">{safe_rng}</span>
       </div>
 
-      <div class="danger-count-bar">
-        <span style="color:#94a3b8;">目前斷頭家數</span>
-        <span style="font-weight:700;color:{d_color};font-variant-numeric:tabular-nums;">{d_status_txt}</span>
-      </div>
-
       <div class="stage-box {f_box}">
         <div class="stage-label">
           <span>① 第一道防線（首波斷頭）</span>
           <span class="badge {f_bcls}">{f_btxt}</span>
         </div>
         <div class="stage-main {f_txt}">{f_headline}</div>
-        <div class="broker-highlight">首波分點：{f_broker}</div>
-        <div class="stage-sub">觸發斷頭價：<strong>{summary['first_price']:,.1f} 元</strong></div>
+        <div class="stage-sub">觸發價 <strong>{summary['first_price']:,.1f} 元</strong> · 首家：{f_broker}</div>
       </div>
 
       <div class="stage-box {p_box}">
@@ -960,7 +838,7 @@ st.sidebar.title("⚙️ 進階參數設定")
 
 data_source = st.sidebar.radio(
     "資料來源",
-    ["免費即時抓取 (證交所/櫃買 + 富邦)", "範例模擬數據 (Demo)", "上傳 CSV 檔案"],
+    ["免費即時抓取 (富邦網頁 + 證交所/櫃買)", "範例模擬數據 (Demo)", "上傳 CSV 檔案", "FinMind API (需 Sponsor)"],
     index=0,
 )
 
@@ -978,28 +856,29 @@ margin_ratio_pct = st.sidebar.slider("融資成數 (%)", min_value=10, max_value
 maint_threshold_pct = st.sidebar.number_input("斷頭/追繳維持率門檻 (%)", min_value=100, max_value=170, value=130, step=1)
 
 # -----------------------------------------------------------------------------
-# Fetch Real Stock-Level Margin Data & Broker Branch Data
+# Fetch & Compute All 3 Methods
 # -----------------------------------------------------------------------------
-fallback_close = float(detected_close) if detected_close else 100.0
-if data_source.startswith("免費即時"):
-    fallback_close = st.sidebar.number_input("手動覆蓋現價 (元)", min_value=1.0, value=fallback_close, step=1.0)
-
-current_price = fallback_close
+current_price = float(detected_close) if (detected_close and detected_close > 0) else 0.0
 margin_hist_df = pd.DataFrame()
 official_price_df = pd.DataFrame()
 stock_margin_stats: Optional[dict] = None
 methods_raw: Dict[str, Tuple[pd.DataFrame, str]] = {}
 
+price_meta_label = "基準收盤價"
 if data_source.startswith("免費即時"):
     official_price_df = fetch_official_daily_closes(stock_id, detected_market)
-    if not official_price_df.empty and (detected_close is None or detected_close <= 0):
+    yf_price, yf_date = fetch_yahoo_latest_price(stock_id, detected_market)
+    if yf_price and yf_price > 0:
+        current_price = yf_price
+        price_meta_label = f"最新報價（Yahoo · {yf_date}）"
+    elif not official_price_df.empty:
         current_price = float(official_price_df["收盤價"].iloc[-1])
+        latest_d = official_price_df["日期"].iloc[-1].strftime("%Y/%m/%d")
+        price_meta_label = f"官方收盤價（{latest_d}）"
+    elif current_price <= 0:
+        current_price = float(DEMO_STOCKS.get(stock_id, {}).get("close", 100.0))
 
     margin_hist_df = fetch_margin_history(stock_id)
-    stock_margin_stats = compute_stock_margin_maintenance(
-        margin_hist_df, official_price_df, current_price, margin_ratio_pct, maint_threshold_pct
-    )
-
     tp = detect_turning_points(margin_hist_df)
     end_dt = tp["latest_date"]
 
@@ -1021,10 +900,9 @@ if data_source.startswith("免費即時"):
             break
 
     if not live_ok:
-        st.warning("免費即時抓取分點受限，分點區塊暫以內建範例數據顯示。")
+        st.warning("免費即時抓取受限或無分點資料，已自動切換為內建範例數據。")
         preset = DEMO_STOCKS.get(stock_id, DEMO_STOCKS["2330"])
-        if detected_close is None:
-            current_price = preset["close"]
+        current_price = preset["close"]
         base_df = pd.DataFrame(preset["branches"])
         methods_raw = {
             "融資起增日": (base_df.copy(), "範例起增日"),
@@ -1042,7 +920,7 @@ elif data_source.startswith("範例"):
         "近60日波段": (base_df.assign(買進均價=(base_df["買進均價"] * 0.97).round(1)), "範例60日"),
     }
 
-else:
+elif data_source.startswith("上傳"):
     uploaded = st.sidebar.file_uploader("上傳 CSV（欄位：分點名稱,買進張數,賣出張數,買進均價）", type=["csv"])
     current_price = st.sidebar.number_input("個股目前收盤價 (元)", min_value=1.0, value=100.0, step=0.5)
     if uploaded is not None:
@@ -1052,6 +930,23 @@ else:
         base_df = pd.DataFrame(DEMO_STOCKS["2330"]["branches"])
         current_price = DEMO_STOCKS["2330"]["close"]
         methods_raw = {"自訂匯入": (base_df, "範例")}
+
+else:
+    fm_token = st.sidebar.text_input("FinMind API Token", type="password")
+    if fm_token:
+        try:
+            for label, d_cnt in [("近20日", 20), ("近40日", 40), ("近60日", 60)]:
+                df_m, current_price = fetch_finmind_branches(stock_id, fm_token, d_cnt)
+                methods_raw[label] = (df_m, f"FinMind 近 {d_cnt} 日")
+        except Exception as e:
+            st.error(f"FinMind 讀取失敗：{e}")
+            base_df = pd.DataFrame(DEMO_STOCKS["2330"]["branches"])
+            current_price = DEMO_STOCKS["2330"]["close"]
+            methods_raw = {"備援範例": (base_df, "範例")}
+    else:
+        base_df = pd.DataFrame(DEMO_STOCKS["2330"]["branches"])
+        current_price = DEMO_STOCKS["2330"]["close"]
+        methods_raw = {"備援範例": (base_df, "範例")}
 
 methods_calc: Dict[str, Tuple[pd.DataFrame, dict, str]] = {}
 for label, (raw_df, rng_str) in methods_raw.items():
@@ -1070,7 +965,7 @@ st.markdown(
           <div class="stock-sub">融資成數 {margin_ratio_pct}% · 追繳門檻 {maint_threshold_pct}% · 紅＝已破斷頭線 ｜ 橘＝再跌 8% 內觸發 ｜ 綠＝緩衝充足</div>
         </div>
         <div class="price-pill">
-          <div class="price-lbl">目前基準收盤價</div>
+          <div class="price-lbl">{html.escape(price_meta_label)}</div>
           <div class="price-val">{current_price:,.1f} <span style="font-size:0.95rem;font-weight:500;color:#94a3b8;">元</span></div>
         </div>
       </div>
@@ -1080,86 +975,8 @@ st.markdown(
 )
 
 # -----------------------------------------------------------------------------
-# Section 1 (Primary): Stock-Level Actual Margin Maintenance & Call Trigger
+# 3-Method Custom Risk Cards (At-a-glance Drop % & Liquidation Triggers)
 # -----------------------------------------------------------------------------
-st.subheader("🎯 個股真實融資維持率與全體斷頭線（排除外資與現股干擾）")
-
-if stock_margin_stats:
-    m_pct = stock_margin_stats["est_maint_pct"]
-    m_drop = stock_margin_stats["drop_to_call_pct"]
-    m_call = stock_margin_stats["est_call_price"]
-    m_cost = stock_margin_stats["est_avg_cost"]
-    m_bal = stock_margin_stats["margin_balance"]
-    m_usage = stock_margin_stats["margin_usage_pct"]
-
-    if m_pct < maint_threshold_pct:
-        m_border, m_tcls, m_badge_cls, m_badge_txt = "border-danger", "text-danger", "badge-danger", "🔴 已破 130%"
-    elif m_pct < maint_threshold_pct + 15:
-        m_border, m_tcls, m_badge_cls, m_badge_txt = "border-warn", "text-warn", "badge-warn", "🟠 接近警戒"
-    else:
-        m_border, m_tcls, m_badge_cls, m_badge_txt = "border-safe", "text-safe", "badge-safe", "🟢 安全水位"
-
-    d_border = "border-danger" if m_drop >= 0 else ("border-warn" if m_drop > -8 else "border-safe")
-    d_tcls = "text-danger" if m_drop >= 0 else ("text-warn" if m_drop > -8 else "text-safe")
-    d_headline = f"已跌破 {m_drop:.1f}%" if m_drop >= 0 else f"再跌 {abs(m_drop):.1f}%"
-
-    mkt_maint = fetch_market_margin_maintenance() if data_source.startswith("免費即時") else None
-    if mkt_maint:
-        mk_r = mkt_maint["ratio_pct"]
-        mk_border = "border-danger" if mk_r < 140 else ("border-warn" if mk_r < 155 else "border-safe")
-        mk_tcls = "text-danger" if mk_r < 140 else ("text-warn" if mk_r < 155 else "text-safe")
-        mk_badge_cls = "badge-danger" if mk_r < 140 else ("badge-warn" if mk_r < 155 else "badge-safe")
-        mk_badge_txt = "🔴 大盤警戒" if mk_r < 140 else ("🟠 偏低震盪" if mk_r < 155 else "🟢 大盤健康")
-        mkt_card_html = f"""
-          <div class="official-card {mk_border}">
-            <div class="o-label"><span>大盤整體融資維持率</span><span class="badge {mk_badge_cls}">{mk_badge_txt}</span></div>
-            <div class="o-val {mk_tcls}">{mk_r:.2f}%</div>
-            <div class="o-sub">{mkt_maint['date']} · 融資增減 {mkt_maint['change_yi']} 億</div>
-          </div>
-        """
-    else:
-        mkt_card_html = """
-          <div class="official-card">
-            <div class="o-label"><span>大盤整體融資維持率</span><span>自動抓取中/暫不可用</span></div>
-            <div class="o-val" style="color:#94a3b8;">--</div>
-            <div class="o-sub">若機房連線受限可本機執行</div>
-          </div>
-        """
-
-    st.markdown(
-        f"""
-        <div class="official-grid">
-          <div class="official-card {m_border}">
-            <div class="o-label"><span>個股整體融資維持率</span><span class="badge {m_badge_cls}">{m_badge_txt}</span></div>
-            <div class="o-val {m_tcls}">{m_pct:.1f}%</div>
-            <div class="o-sub">融資平均成本約 {m_cost:,.1f} 元</div>
-          </div>
-          <div class="official-card {d_border}">
-            <div class="o-label"><span>全體融資 130% 斷頭線</span><span>依近 {len(stock_margin_stats["history_df"])} 日融資買賣滾動計算</span></div>
-            <div class="o-val {d_tcls}">{d_headline}</div>
-            <div class="o-sub">整體斷頭價約 <strong>{m_call:,.1f} 元</strong></div>
-          </div>
-          <div class="official-card">
-            <div class="o-label"><span>個股最新融資餘額</span><span>資料日 {stock_margin_stats['latest_date'].strftime('%Y/%m/%d')}</span></div>
-            <div class="o-val text-sky">{m_bal:,} <span style="font-size:0.95rem;color:#94a3b8;">張</span></div>
-            <div class="o-sub">融資使用率：{m_usage:.2f}%</div>
-          </div>
-          {mkt_card_html}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-else:
-    st.info("目前無該股近期融資買賣明細（可能為無信用交易標的或範例模式）。")
-
-st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-
-# -----------------------------------------------------------------------------
-# Section 2 (Secondary): 3-Method Broker Branch Reference Cards
-# -----------------------------------------------------------------------------
-st.subheader("🏦 輔助參考：主力買超分點推估斷頭防線")
-st.caption("提醒：分點買賣超包含現股與法人部位，僅供輔助觀察主力大戶成本壓力帶；實際融資斷頭水位請以上方「個股真實融資維持率」為主。")
-
 cols = st.columns(len(methods_calc))
 for col, (label, (_, summary, rng_str)) in zip(cols, methods_calc.items()):
     with col:
@@ -1179,7 +996,6 @@ for tab, (label, (calc_df, summary, rng_str)) in zip(tabs, methods_calc.items())
             continue
 
         wall_df = summary["wall_df"]
-        st.caption(f"{label}（{rng_str}）— 各價位斷頭賣壓張數（由高價往下排列）")
         fig = px.bar(
             wall_df,
             x="潛在斷頭張數",
@@ -1192,13 +1008,14 @@ for tab, (label, (calc_df, summary, rng_str)) in zip(tabs, methods_calc.items())
                 "高危警戒": "#f59e0b",
                 "安全緩衝": "#10b981",
             },
+            title=f"{label}（{rng_str}）— 各價位斷頭賣壓張數（由高價往下排列）",
         )
         fig.update_traces(texttemplate="%{text:,} 張", textposition="outside", cliponaxis=False)
         fig.update_layout(
-            height=320,
-            margin=dict(l=6, r=58, t=38, b=10),
+            height=300,
+            margin=dict(l=10, r=60, t=40, b=10),
             dragmode=False,
-            legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="left", x=0, title=""),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title=""),
             xaxis=dict(fixedrange=True, title="潛在斷頭賣壓 (張)"),
             yaxis=dict(fixedrange=True, title=""),
         )
@@ -1207,30 +1024,10 @@ for tab, (label, (calc_df, summary, rng_str)) in zip(tabs, methods_calc.items())
         st.dataframe(calc_df, use_container_width=True, hide_index=True)
 
 # -----------------------------------------------------------------------------
-# Collapsible Extra Charts & Unified Comparison Table
+# Unified 3-Method Comparison Table (Collapsible to keep main view clean)
 # -----------------------------------------------------------------------------
-if stock_margin_stats is not None:
-    with st.expander("📈 展開：個股近期融資維持率 & 融資餘額走勢", expanded=False):
-        hist_df = stock_margin_stats["history_df"]
-        fig_m = px.line(
-            hist_df,
-            x="日期",
-            y="推估融資維持率(%)",
-            markers=True,
-            labels={"日期": "交易日", "推估融資維持率(%)": "推估維持率 (%)"},
-        )
-        fig_m.add_hline(y=maint_threshold_pct, line_dash="dash", line_color="#f43f5e", annotation_text=f"{maint_threshold_pct}% 追繳線")
-        fig_m.update_layout(
-            height=260,
-            margin=dict(l=10, r=10, t=25, b=10),
-            dragmode=False,
-            xaxis=dict(fixedrange=True),
-            yaxis=dict(fixedrange=True),
-        )
-        st.plotly_chart(fig_m, use_container_width=True, config=PLOTLY_MOBILE_CONFIG)
-
 if len(methods_calc) > 1:
-    with st.expander("📋 展開：各分點三種基準斷頭價並排對照表", expanded=False):
+    with st.expander("🏦 展開：各分點三種基準斷頭價並排對照表", expanded=True):
         merged_df: Optional[pd.DataFrame] = None
         for label, (calc_df, _, _) in methods_calc.items():
             if calc_df.empty:
@@ -1248,3 +1045,21 @@ if len(methods_calc) > 1:
             first_price_col = [c for c in merged_df.columns if c.endswith("_斷頭價")][0]
             merged_df = merged_df.sort_values(by=first_price_col, ascending=False).reset_index(drop=True)
             st.dataframe(merged_df, use_container_width=True, hide_index=True)
+
+if not margin_hist_df.empty:
+    with st.expander("📈 展開：近期融資餘額走勢（轉折偵測依據）", expanded=False):
+        fig_margin = px.line(
+            margin_hist_df,
+            x="日期",
+            y="融資餘額",
+            markers=True,
+            labels={"日期": "交易日", "融資餘額": "融資餘額 (張)"},
+        )
+        fig_margin.update_layout(
+            height=250,
+            margin=dict(l=10, r=10, t=20, b=10),
+            dragmode=False,
+            xaxis=dict(fixedrange=True),
+            yaxis=dict(fixedrange=True),
+        )
+        st.plotly_chart(fig_margin, use_container_width=True, config=PLOTLY_MOBILE_CONFIG)
