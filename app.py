@@ -362,25 +362,36 @@ def fetch_official_daily_closes(stock_id: str, market: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=120)
 def fetch_taiex_latest() -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """Fetch latest TAIEX (^TWII) index value, change %, and date from Yahoo Finance."""
+    """Fetch latest TAIEX (^TWII) index value, true 1-day change %, and date from Yahoo Finance."""
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ETWII?interval=1d&range=5d"
         resp = requests.get(url, headers=HEADERS, timeout=8)
         if resp.status_code != 200:
             return None, None, None
-        meta = resp.json()["chart"]["result"][0]["meta"]
-        price = meta.get("regularMarketPrice") or meta.get("previousClose")
-        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+        res0 = resp.json()["chart"]["result"][0]
+        meta = res0.get("meta", {})
+        closes_raw = res0.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+        closes = [float(c) for c in closes_raw if c is not None and float(c) > 0]
+
+        price = meta.get("regularMarketPrice") or (closes[-1] if closes else None)
+        if not price or float(price) <= 0:
+            return None, None, None
+        p_val = float(price)
+
+        # True 1-day previous close: second-to-last daily close (not 5-day chartPreviousClose)
+        if len(closes) >= 2:
+            prev_val = closes[-2]
+        else:
+            prev_val = float(meta.get("previousClose") or p_val)
+
+        chg_pct = ((p_val - prev_val) / prev_val * 100.0) if prev_val > 0 else 0.0
         ts = meta.get("regularMarketTime")
-        if price and float(price) > 0:
-            p_val = float(price)
-            chg_pct = ((p_val - float(prev)) / float(prev) * 100.0) if prev and float(prev) > 0 else 0.0
-            dt_str = (
-                (datetime.utcfromtimestamp(int(ts)) + timedelta(hours=8)).strftime("%Y/%m/%d")
-                if ts
-                else "最新"
-            )
-            return p_val, round(chg_pct, 2), dt_str
+        dt_str = (
+            (datetime.utcfromtimestamp(int(ts)) + timedelta(hours=8)).strftime("%Y/%m/%d")
+            if ts
+            else "最新"
+        )
+        return p_val, round(chg_pct, 2), dt_str
     except Exception:
         pass
     return None, None, None
@@ -934,7 +945,8 @@ def render_risk_card(label: str, rng_str: str, summary: dict) -> str:
 def _fetch_twse_rwd_latest_margin_and_price() -> Optional[dict]:
     """
     Fetch freshest trading day TWSE listed margin balances + closing prices from
-    www.twse.com.tw/rwd (updates immediately on trading evening, unlike lagged openapi).
+    www.twse.com.tw/rwd, AND compute exact market-wide margin maintenance ratio directly
+    from official TWSE total margin loan amount vs. total margin collateral market value.
     """
     today = date.today()
     for offset in range(7):
@@ -948,12 +960,20 @@ def _fetch_twse_rwd_latest_margin_and_price() -> Optional[dict]:
             if m_json.get("stat") != "OK":
                 continue
 
-            # Find the stock-level table inside m_json["tables"]
+            # Extract official total margin loan amount (in NTD thousands) from summary table
+            total_margin_loan_k: Optional[float] = None
             stock_table = None
             for tb in m_json.get("tables", []):
-                if len(tb.get("data", [])) > 100:
+                data_rows = tb.get("data", [])
+                if len(data_rows) > 100:
                     stock_table = tb
-                    break
+                else:
+                    for srow in data_rows:
+                        if srow and "融資金額" in str(srow[0]):
+                            # Columns: 項目, 買進, 賣出, 現金(券)償還, 前日餘額, 今日餘額
+                            val = _parse_float(srow[5]) if len(srow) > 5 else None
+                            if val and val > 0:
+                                total_margin_loan_k = val
             if not stock_table:
                 continue
 
@@ -977,6 +997,7 @@ def _fetch_twse_rwd_latest_margin_and_price() -> Optional[dict]:
 
             total_cnt = 0
             total_net_chg = 0
+            total_collateral_value_ntd = 0.0
             rows = []
             for row in stock_table["data"]:
                 if len(row) < 7:
@@ -994,6 +1015,10 @@ def _fetch_twse_rwd_latest_margin_and_price() -> Optional[dict]:
                 p_info = price_map.get(code)
                 if not p_info:
                     continue
+
+                if today_bal > 0:
+                    total_collateral_value_ntd += today_bal * 1000.0 * p_info["close"]
+
                 drop_ratio = (net_chg / prev_bal * 100.0) if prev_bal > 0 else 0.0
                 if p_info["chg_pct"] < 0 and (drop_ratio <= -3.0 or net_chg <= -300) and prev_bal >= 100:
                     rows.append(
@@ -1010,15 +1035,51 @@ def _fetch_twse_rwd_latest_margin_and_price() -> Optional[dict]:
                         }
                     )
 
+            calc_maint_pct: Optional[float] = None
+            if total_margin_loan_k and total_margin_loan_k > 0 and total_collateral_value_ntd > 0:
+                calc_maint_pct = round((total_collateral_value_ntd / (total_margin_loan_k * 1000.0)) * 100.0, 2)
+
             return {
                 "date_str": d.strftime("%Y/%m/%d"),
                 "total": total_cnt,
                 "net_chg": total_net_chg,
+                "calc_maint_pct": calc_maint_pct,
+                "loan_yi": round(total_margin_loan_k / 100000.0, 2) if total_margin_loan_k else None,
                 "rows": rows,
             }
         except Exception:
             continue
     return None
+
+
+def _extract_tpex_margin_fields(r: dict) -> Tuple[str, str, float, float, float]:
+    """Robustly extract (code, name, prev_bal, today_bal, m_sell) from TPEx margin JSON row."""
+    keys = list(r.keys())
+    vals = list(r.values())
+
+    def find_by_keywords(include_any: Tuple[str, ...], exclude_any: Tuple[str, ...] = ()) -> Optional[str]:
+        for k in keys:
+            kl = k.lower().strip()
+            if any(ex in kl for ex in exclude_any):
+                continue
+            if any(inc in kl for inc in include_any):
+                return k
+        return None
+
+    k_code = find_by_keywords(("securitiescompanycode", "code", "代號"))
+    k_name = find_by_keywords(("companyname", "name", "名稱"))
+    k_prev = find_by_keywords(("prev", "yesterday", "前資"), ("short", "券"))
+    k_sell = find_by_keywords(("marginsell", "purchasesell", "資賣"), ("short", "券"))
+    k_today = find_by_keywords(("marginbalance", "todaybalance", "資餘額", "融資餘額"), ("prev", "yesterday", "short", "券", "limit", "限額", "ratio", "率"))
+
+    code = str(r.get(k_code, "")).strip() if k_code else (str(vals[1]).strip() if len(vals) > 1 else "")
+    name = str(r.get(k_name, "")).strip() if k_name else (str(vals[2]).strip() if len(vals) > 2 else "")
+
+    prev_bal = _parse_float(r.get(k_prev)) if k_prev else (_parse_float(vals[3]) if len(vals) > 3 else None)
+    m_sell = _parse_float(r.get(k_sell)) if k_sell else (_parse_float(vals[5]) if len(vals) > 5 else None)
+    today_bal = _parse_float(r.get(k_today)) if k_today else (_parse_float(vals[7]) if len(vals) > 7 else None)
+
+    return code, name, (prev_bal or 0.0), (today_bal or 0.0), (m_sell or 0.0)
 
 
 def _fetch_tpex_latest_margin_and_price() -> Optional[dict]:
@@ -1051,17 +1112,7 @@ def _fetch_tpex_latest_margin_and_price() -> Optional[dict]:
         total_net_chg = 0
         rows = []
         for r in m_resp.json():
-            # Handle both English & Chinese TPEx OpenAPI field names defensively
-            code = str(r.get("SecuritiesCompanyCode") or r.get("代號") or "").strip()
-            name = str(r.get("CompanyName") or r.get("名稱") or "").strip()
-            prev_bal = _parse_float(
-                r.get("MarginPurchaseYesterdayBalance") or r.get("前資餘額(張)") or r.get("前資餘額")
-            ) or 0.0
-            today_bal = _parse_float(
-                r.get("MarginPurchaseTodayBalance") or r.get("資餘額") or r.get("融資餘額")
-            ) or 0.0
-            m_sell = _parse_float(r.get("MarginPurchaseSell") or r.get("資賣")) or 0.0
-
+            code, name, prev_bal, today_bal, m_sell = _extract_tpex_margin_fields(r)
             if not code or (prev_bal <= 0 and today_bal <= 0):
                 continue
             total_cnt += 1
@@ -1129,6 +1180,8 @@ def fetch_market_daily_liquidation_scan() -> Optional[dict]:
         "grand_total": grand_total,
         "grand_pct": round(grand_hit / grand_total * 100.0, 2) if grand_total else 0.0,
         "grand_net_chg": (twse["net_chg"] if twse else 0) + (tpex["net_chg"] if tpex else 0),
+        "twse_calc_maint_pct": twse.get("calc_maint_pct") if twse else None,
+        "twse_loan_yi": twse.get("loan_yi") if twse else None,
         "washout_df": washout_df,
     }
 
@@ -1176,7 +1229,17 @@ def scan_top_sell_brokers_for_stocks(stock_codes: Tuple[str, ...]) -> pd.DataFra
 # Top Market-Wide Dashboard: TAIEX Liquidation Wave + Listed/OTC Daily Scan
 # -----------------------------------------------------------------------------
 taiex_val, taiex_chg, taiex_date = fetch_taiex_latest()
+mkt_scan = fetch_market_daily_liquidation_scan()
 mkt_maint_top = fetch_market_margin_maintenance()
+
+# If KGI/PSCNet is blocked by cloud IP, use exact official TWSE MI_MARGN computed maintenance ratio!
+if not mkt_maint_top and mkt_scan and mkt_scan.get("twse_calc_maint_pct"):
+    mkt_maint_top = {
+        "date": mkt_scan["twse_date"],
+        "ratio_pct": mkt_scan["twse_calc_maint_pct"],
+        "change_yi": f"餘額 {mkt_scan['twse_loan_yi']:,.0f}" if mkt_scan.get("twse_loan_yi") else "--",
+        "source": "證交所官方實算",
+    }
 
 st.subheader("🚨 台股大盤大宗斷頭潮評估 & 當日疑似斷頭掃描（上市＋上櫃）")
 
@@ -1200,7 +1263,7 @@ if taiex_val and mkt_maint_top:
         f"""
         <div class="official-grid">
           <div class="official-card">
-            <div class="o-label"><span>加權指數 · 大盤維持率</span><span>{taiex_date}</span></div>
+            <div class="o-label"><span>加權指數（{taiex_chg:+.2f}%）</span><span>{taiex_date}</span></div>
             <div class="o-val text-sky">{taiex_val:,.0f} <span style="font-size:0.9rem;color:#94a3b8;">點</span></div>
             <div class="o-sub">大盤維持率 <strong>{cur_r:.2f}%</strong>（{mkt_maint_top['source']} {mkt_maint_top['date']}）</div>
           </div>
@@ -1221,7 +1284,6 @@ if taiex_val and mkt_maint_top:
 elif taiex_val:
     st.caption(f"加權指數最新：**{taiex_val:,.0f} 點**（{taiex_date}，{taiex_chg:+.2f}%）；大盤融資維持率來源暫時受限。")
 
-mkt_scan = fetch_market_daily_liquidation_scan()
 if mkt_scan:
     sc_border = "border-danger" if mkt_scan["grand_pct"] >= 15 else ("border-warn" if mkt_scan["grand_pct"] >= 5 else "border-safe")
     sc_tcls = "text-danger" if mkt_scan["grand_pct"] >= 15 else ("text-warn" if mkt_scan["grand_pct"] >= 5 else "text-safe")
