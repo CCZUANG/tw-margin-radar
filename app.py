@@ -24,7 +24,7 @@ st.markdown(
     """
     <style>
       .block-container {
-        padding-top: 1.1rem;
+        padding-top: 3.4rem !important;
         padding-bottom: 2.5rem;
         max-width: 1200px;
       }
@@ -883,17 +883,185 @@ def render_risk_card(label: str, rng_str: str, summary: dict) -> str:
     """
 
 
+
+@st.cache_data(ttl=1800)
+def fetch_market_daily_liquidation_scan() -> Optional[dict]:
+    """
+    Scan all TWSE listed marginable stocks via TWSE OpenAPI (MI_MARGN + STOCK_DAY_ALL)
+    to identify stocks with price drops + heavy margin reduction (suspected margin calls/washout).
+    """
+    try:
+        m_resp = requests.get(
+            "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN", headers=HEADERS, timeout=12
+        )
+        p_resp = requests.get(
+            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=HEADERS, timeout=12
+        )
+        m_resp.raise_for_status()
+        p_resp.raise_for_status()
+
+        price_map: Dict[str, dict] = {}
+        for r in p_resp.json():
+            c = str(r.get("Code", "")).strip()
+            close_p = _parse_float(r.get("ClosingPrice"))
+            chg = _parse_float(r.get("Change"))
+            if c and close_p and close_p > 0:
+                prev_p = close_p - (chg or 0.0)
+                chg_pct = ((chg or 0.0) / prev_p * 100.0) if prev_p > 0 else 0.0
+                price_map[c] = {"close": close_p, "chg_pct": round(chg_pct, 2)}
+
+        total_margin_stocks = 0
+        total_net_chg = 0
+        washout_rows: List[dict] = []
+
+        for r in m_resp.json():
+            code = str(r.get("股票代號", "")).strip()
+            name = str(r.get("股票名稱", "")).strip()
+            prev_bal = _parse_float(r.get("融資前日餘額")) or 0.0
+            today_bal = _parse_float(r.get("融資今日餘額")) or 0.0
+            m_sell = _parse_float(r.get("融資賣出")) or 0.0
+
+            if prev_bal <= 0 and today_bal <= 0:
+                continue
+
+            total_margin_stocks += 1
+            net_chg = int(round(today_bal - prev_bal))
+            total_net_chg += net_chg
+
+            p_info = price_map.get(code)
+            if not p_info:
+                continue
+
+            drop_ratio_pct = (net_chg / prev_bal * 100.0) if prev_bal > 0 else 0.0
+
+            # Suspected margin liquidation / forced washout:
+            # Price dropped AND margin balance shrank noticeably (>= 3% or >= 300 lots)
+            if p_info["chg_pct"] < 0 and (drop_ratio_pct <= -3.0 or net_chg <= -300) and prev_bal >= 100:
+                washout_rows.append(
+                    {
+                        "股號": code,
+                        "名稱": name,
+                        "收盤價": p_info["close"],
+                        "漲跌幅(%)": p_info["chg_pct"],
+                        "融資淨減(張)": net_chg,
+                        "融資減幅(%)": round(drop_ratio_pct, 2),
+                        "融資賣出(張)": int(m_sell),
+                        "融資餘額(張)": int(today_bal),
+                    }
+                )
+
+        washout_df = pd.DataFrame(washout_rows)
+        if not washout_df.empty:
+            washout_df = washout_df.sort_values(by=["融資淨減(張)", "融資減幅(%)"], ascending=[True, True]).reset_index(drop=True)
+
+        ratio_of_market = (len(washout_df) / total_margin_stocks * 100.0) if total_margin_stocks > 0 else 0.0
+        return {
+            "total_margin_stocks": total_margin_stocks,
+            "washout_count": len(washout_df),
+            "washout_ratio_pct": round(ratio_of_market, 2),
+            "total_net_chg": total_net_chg,
+            "washout_df": washout_df,
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=900)
+def scan_top_sell_brokers_for_stocks(stock_codes: Tuple[str, ...]) -> pd.DataFrame:
+    """Fetch latest sell-side broker branches for top washout stocks and rank heaviest sellers."""
+    agg: Dict[str, dict] = {}
+    for code in stock_codes:
+        url = f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco_{code}.djhtm"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            if resp.status_code != 200:
+                continue
+            resp.encoding = resp.apparent_encoding or "big5"
+            soup = BeautifulSoup(resp.text, "lxml")
+            for tr in soup.find_all("tr"):
+                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+                # Right half of table (columns 5..9) holds 賣超券商, 買進, 賣出, 賣超, 佔比
+                if len(tds) >= 9:
+                    broker = tds[5]
+                    if not broker or broker in ("賣超券商", "合計", "總計"):
+                        continue
+                    try:
+                        sell_net = int(tds[8].replace(",", ""))
+                        if sell_net > 0:
+                            if broker not in agg:
+                                agg[broker] = {"賣超張數": 0, "涉及檔數": 0}
+                            agg[broker]["賣超張數"] += sell_net
+                            agg[broker]["涉及檔數"] += 1
+                    except ValueError:
+                        continue
+        except Exception:
+            continue
+
+    if not agg:
+        return pd.DataFrame()
+    rows = [{"券商分點": k, "合計賣超(張)": v["賣超張數"], "砍倉檔數": v["涉及檔數"]} for k, v in agg.items()]
+    return pd.DataFrame(rows).sort_values(by="合計賣超(張)", ascending=False).head(15).reset_index(drop=True)
+
 # -----------------------------------------------------------------------------
 # Main Page Search Bar (Top)
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Top Market-Wide Daily Suspected Margin Liquidation Scanner
+# -----------------------------------------------------------------------------
+st.subheader("🚨 全台股當日融資急殺／疑似斷頭掃描（上市全市場）")
+mkt_scan = fetch_market_daily_liquidation_scan()
+if mkt_scan:
+    sc_cnt = mkt_scan["washout_count"]
+    sc_tot = mkt_scan["total_margin_stocks"]
+    sc_pct = mkt_scan["washout_ratio_pct"]
+    sc_net = mkt_scan["total_net_chg"]
+    sc_border = "border-danger" if sc_pct >= 15 else ("border-warn" if sc_pct >= 5 else "border-safe")
+    sc_tcls = "text-danger" if sc_pct >= 15 else ("text-warn" if sc_pct >= 5 else "text-safe")
+
+    st.markdown(
+        f"""
+        <div class="official-grid">
+          <div class="official-card {sc_border}">
+            <div class="o-label"><span>當日疑似斷頭／融資急殺家數</span><span>股價跌且融資大減</span></div>
+            <div class="o-val {sc_tcls}">{sc_cnt} <span style="font-size:0.95rem;color:#94a3b8;">/ {sc_tot} 檔</span></div>
+            <div class="o-sub">佔全體上市融資股 <strong>{sc_pct:.2f}%</strong></div>
+          </div>
+          <div class="official-card">
+            <div class="o-label"><span>上市全市場單日融資淨變動</span><span>TWSE MI_MARGN</span></div>
+            <div class="o-val {'text-danger' if sc_net < 0 else 'text-sky'}">{sc_net:+,} <span style="font-size:0.95rem;color:#94a3b8;">張</span></div>
+            <div class="o-sub">{'整體融資呈現退場減肥' if sc_net < 0 else '整體融資呈現淨增加'}</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    washout_df = mkt_scan["washout_df"]
+    if not washout_df.empty:
+        with st.expander(f"📋 展開：當日疑似斷頭重災股排行（前 {min(15, len(washout_df))} 檔）與重災分點掃描", expanded=False):
+            st.dataframe(washout_df.head(15), use_container_width=True, hide_index=True)
+            top5_codes = tuple(washout_df["股號"].head(5).tolist())
+            if st.button("🔍 一鍵掃描前 5 大重災股：哪家分點砍最多"):
+                with st.spinner("正在掃描前 5 大重災股賣超分點..."):
+                    top_sellers = scan_top_sell_brokers_for_stocks(top5_codes)
+                if not top_sellers.empty:
+                    st.caption(f"統計標的：{', '.join(top5_codes)}（依最新一日賣超張數加總排行）")
+                    st.dataframe(top_sellers, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("目前無法從公開分點網頁取得賣超排行（可能受雲端機房 IP 限制）。")
+    else:
+        st.caption("最新交易日無符合「股價下跌且單日融資大減 ≥3% 或 ≥300 張」的上市個股。")
+else:
+    st.caption("全市場融資掃描暫時無法連線至證交所 OpenAPI。")
+
 catalog = load_all_tw_stocks()
 
 search_col1, search_col2 = st.columns([3, 2])
 with search_col1:
     user_query = st.text_input(
-        "🔍 搜尋台股（支援股號或公司名稱，例如：2330、台積電、群聯）",
+        "🔍 搜尋個股（股號或公司名稱）",
         value="2330",
-        placeholder="輸入股號或公司名稱後按 Enter...",
+        placeholder="例如：2330、台積電、群聯",
     )
 
 matches = resolve_stock_query(user_query, catalog)
